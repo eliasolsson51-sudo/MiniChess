@@ -2,6 +2,10 @@ package app.minimouse;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.app.KeyguardManager;
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
@@ -35,9 +39,8 @@ import java.util.Set;
  * A D-pad mouse cursor for any app.
  *
  *   Hold *       cursor on/off (not while the keyboard is open: TT9 uses it)
- *   D-pad        short press: jump to the nearest button/link in that direction
- *                (a plain step where there's nothing to jump to, e.g. over text);
- *                hold: glide freely. Pushing against the top/bottom edge scrolls.
+ *   D-pad        short press: one small step; hold: glide (gently slowed over
+ *                buttons). Pushing against the top/bottom edge scrolls.
  *   OK           finger down/up: short = tap, hold = long press.
  *                Taps the middle of the outlined element.
  *   5            long press
@@ -45,18 +48,20 @@ import java.util.Set;
  *   1            drag mode: finger down / finger up (select text, sliders, maps)
  *   7            paste into the focused text field
  *   2 / 8        previous / next post
- *   3 / 9        zoom in / out
+ *   3 / 9        zoom in / out a little; hold to keep zooming
  *   4 / 6        scroll left / right; hold = swipe in from the left / right edge
  *   Back         back in the app as normal (ends a drag)
  *
- * The cursor pauses itself while the keyboard is open and in apps picked in the app
- * screen, hides after a few idle seconds, and remembers its position per app.
+ * The cursor pauses itself on the lock screen, while the keyboard is open and in apps
+ * picked in the app screen. It hides while scrolling and after a few idle seconds,
+ * and remembers its position per app. A faint outline marks the button under a
+ * resting cursor; OK taps its middle.
  */
 public class MouseService extends AccessibilityService {
 
     private static final long HOLD_DELAY_MS = 150;
     private static final long HOLD_INTERVAL_MS = 30;
-    private static final float STEP_DP = 8f;           // one press without a jump target
+    private static final float STEP_DP = 8f;           // one short press
     private static final float HOLD_START_DP = 6f;     // per 30 ms when held
     private static final float HOLD_RAMP_DP = 1.5f;
     private static final float HOLD_MAX_DP = 30f;
@@ -65,6 +70,10 @@ public class MouseService extends AccessibilityService {
     private static final long EDGE_SCROLL_EVERY_MS = 260;
     private static final long IDLE_HIDE_MS = 4000;
     private static final long TARGETS_MAX_AGE_MS = 400;
+    private static final float MAGNET = 0.45f;         // speed factor over a button while gliding
+    private static final long OUTLINE_DELAY_MS = 350;  // outline appears once the cursor rests
+    private static final long SCROLL_QUIET_MS = 600;   // cursor/outline hidden after a scroll
+    private static final long ZOOM_REPEAT_MS = 380;    // hold 3/9
 
     private WindowManager wm;
     private Pointer pointer;
@@ -74,6 +83,9 @@ public class MouseService extends AccessibilityService {
     boolean active = false;      // the user has turned the cursor on
     boolean suspended = false;   // paused: keyboard open or a paused app in front
     boolean idleHidden = false;  // hidden after a while without movement
+    boolean scrollHidden = false; // hidden while the page scrolls
+    boolean outlineShown = false; // outline only once the cursor rests
+    private long lastScroll = 0;
     float x, y;
     float dp;
     private int screenW, screenH;
@@ -120,6 +132,7 @@ public class MouseService extends AccessibilityService {
             if (holdKey < 0) return;
             holdSteps++;
             float speed = Math.min(HOLD_MAX_DP, HOLD_START_DP + holdSteps * HOLD_RAMP_DP) * dp;
+            if (!dragging && overButton()) speed *= MAGNET; // gentle magnet while gliding
             moveBy(holdDx * speed, holdDy * speed, holdDy);
             noteActivity();
             handler.postDelayed(this, HOLD_INTERVAL_MS);
@@ -155,6 +168,40 @@ public class MouseService extends AccessibilityService {
         }
     };
 
+    private final Runnable endScrollHide = () -> {
+        scrollHidden = false;
+        targetsTime = 0;
+        updateVisibility();
+        scheduleOutline();
+    };
+
+    private final Runnable showOutline = () -> {
+        if (holdKey >= 0 || dragging || scrollHidden) return;
+        if (SystemClock.uptimeMillis() - lastScroll < SCROLL_QUIET_MS) return;
+        updateOutline();
+        outlineShown = outline != null;
+        if (pointer != null) pointer.invalidate();
+    };
+
+    // Hold 3/9 = keep zooming.
+    private int zoomKey = -1;
+    private final Runnable zoomRepeat = new Runnable() {
+        @Override
+        public void run() {
+            if (zoomKey < 0) return;
+            pinch(zoomKey == KeyEvent.KEYCODE_3);
+            handler.postDelayed(this, ZOOM_REPEAT_MS);
+        }
+    };
+
+    // Lock screen.
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            updateSuspended();
+        }
+    };
+
     String toast = null;
     private final Runnable hideToast = () -> {
         toast = null;
@@ -176,6 +223,14 @@ public class MouseService extends AccessibilityService {
         prefs = Prefs.get(this);
         excluded = Prefs.excluded(this);
         prefs.registerOnSharedPreferenceChangeListener(prefsListener);
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_SCREEN_OFF);
+        f.addAction(Intent.ACTION_SCREEN_ON);
+        f.addAction(Intent.ACTION_USER_PRESENT);
+        try {
+            registerReceiver(screenReceiver, f);
+        } catch (Exception ignored) {
+        }
 
         pointer = new Pointer(this);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
@@ -218,6 +273,10 @@ public class MouseService extends AccessibilityService {
     public void onDestroy() {
         stopHold();
         if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(prefsListener);
+        try {
+            unregisterReceiver(screenReceiver);
+        } catch (Exception ignored) {
+        }
         if (pointer != null) {
             try {
                 wm.removeView(pointer);
@@ -255,12 +314,13 @@ public class MouseService extends AccessibilityService {
             y = screenH / 2f;
         }
         outline = null;
+        outlineShown = false;
         if (pointer != null) pointer.invalidate();
     }
 
     /** Pauses the cursor while typing or in a paused app; brings it back afterwards. */
     private boolean updateSuspended() {
-        boolean should = active && (keyboardOpen()
+        boolean should = active && (isLocked() || keyboardOpen()
                 || (excluded != null && excluded.contains(currentPkg)));
         if (should != suspended) {
             suspended = should;
@@ -273,6 +333,15 @@ public class MouseService extends AccessibilityService {
             updateVisibility();
         }
         return suspended;
+    }
+
+    private boolean isLocked() {
+        try {
+            KeyguardManager km = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+            return km != null && km.isKeyguardLocked();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private boolean keyboardOpen() {
@@ -374,9 +443,23 @@ public class MouseService extends AccessibilityService {
                     } else {
                         swipe(x, y, Math.max(1, x - screenW * 0.35f), y, 250);
                     }
-                    targetsTime = 0;
+                    noteScroll();
                 }
                 sideKey = -1;
+            }
+            return true;
+        }
+
+        // 3/9: a small zoom step per press; holding keeps zooming.
+        if (code == KeyEvent.KEYCODE_3 || code == KeyEvent.KEYCODE_9) {
+            if (firstDown) {
+                zoomKey = code;
+                pinch(code == KeyEvent.KEYCODE_3);
+                handler.removeCallbacks(zoomRepeat);
+                handler.postDelayed(zoomRepeat, ZOOM_REPEAT_MS + 150);
+            } else if (!down && code == zoomKey) {
+                zoomKey = -1;
+                handler.removeCallbacks(zoomRepeat);
             }
             return true;
         }
@@ -401,12 +484,6 @@ public class MouseService extends AccessibilityService {
                 return true;
             case KeyEvent.KEYCODE_8:
                 smartScroll(1);
-                return true;
-            case KeyEvent.KEYCODE_3:
-                pinch(true);
-                return true;
-            case KeyEvent.KEYCODE_9:
-                pinch(false);
                 return true;
             case KeyEvent.KEYCODE_0:
                 doubleTap();
@@ -490,7 +567,7 @@ public class MouseService extends AccessibilityService {
     }
 
     boolean cursorVisible() {
-        return active && !suspended && !idleHidden;
+        return active && !suspended && !idleHidden && !scrollHidden;
     }
 
     private void startHold(int key, int dx, int dy) {
@@ -505,43 +582,26 @@ public class MouseService extends AccessibilityService {
     private void stopHold() {
         holdKey = -1;
         handler.removeCallbacks(holdStep);
+        handler.removeCallbacks(zoomRepeat);
+        zoomKey = -1;
     }
 
     // ---------------------------------------------------------------- moving
 
-    /** Short press: jump to the nearest clickable in that direction, or take a plain step. */
+    /** Short press: one small step. */
     private void shortMove(int dx, int dy) {
-        if (!dragging) {
-            refreshTargets(false);
-            if (smartHere()) {
-                Rect best = null;
-                float bestScore = Float.MAX_VALUE;
-                float maxAlong = (dy != 0 ? screenH : screenW) * 0.45f;
-                float minAlong = 4 * dp;
-                Rect current = outline;
-                for (Target t : targets) {
-                    if (current != null && t.r.equals(current)) continue;
-                    if (t.r.contains((int) x, (int) y)) continue; // the one we're on
-                    float vx = t.r.exactCenterX() - x, vy = t.r.exactCenterY() - y;
-                    float along = vx * dx + vy * dy;
-                    if (along < minAlong || along > maxAlong) continue;
-                    float across = Math.abs(vx * dy - vy * dx);
-                    float score = along + 2f * across;
-                    if (score < bestScore) {
-                        bestScore = score;
-                        best = t.r;
-                    }
-                }
-                if (best != null) {
-                    x = clampX(best.exactCenterX());
-                    y = clampY(best.exactCenterY());
-                    updateOutline();
-                    if (pointer != null) pointer.invalidate();
-                    return;
-                }
-            }
-        }
         moveBy(dx * STEP_DP * dp, dy * STEP_DP * dp, dy);
+    }
+
+    /** Is the cursor over a real button (not while scrolling, not over text)? */
+    private boolean overButton() {
+        if (SystemClock.uptimeMillis() - lastScroll < SCROLL_QUIET_MS) return false;
+        refreshTargets(true);
+        if (!smartHere()) return false;
+        for (Target t : targets) {
+            if (t.r.contains((int) x, (int) y)) return true;
+        }
+        return false;
     }
 
     /** Moves the cursor; pushing against the top or bottom edge scrolls the page instead. */
@@ -556,8 +616,27 @@ public class MouseService extends AccessibilityService {
         x = Math.max(0, Math.min(screenW - 1, x + ddx));
         y = Math.max(0, Math.min(screenH - 1, y + ddy));
         if (dragging) dragTo(x, y);
-        else updateOutline();
+        outlineShown = false;
+        scheduleOutline();
         if (pointer != null) pointer.invalidate();
+    }
+
+    private void scheduleOutline() {
+        handler.removeCallbacks(showOutline);
+        handler.postDelayed(showOutline, OUTLINE_DELAY_MS);
+    }
+
+    /** Hides the cursor and outline while the page scrolls; back shortly after. */
+    private void noteScroll() {
+        lastScroll = SystemClock.uptimeMillis();
+        targetsTime = 0;
+        outline = null;
+        outlineShown = false;
+        handler.removeCallbacks(showOutline);
+        scrollHidden = true;
+        updateVisibility();
+        handler.removeCallbacks(endScrollHide);
+        handler.postDelayed(endScrollHide, SCROLL_QUIET_MS);
     }
 
     private void edgeScroll(int dir) {
@@ -573,14 +652,14 @@ public class MouseService extends AccessibilityService {
             float sy = screenH * 0.25f;
             stillSwipe(cx, sy, cx, sy + dist, 220);
         }
-        targetsTime = 0;
+        noteScroll();
     }
 
     // ---------------------------------------------------------------- clickables
 
     /** Smart jumping only where it helps: enough buttons around, not over a block of text. */
     private boolean smartHere() {
-        if (targets.size() < 3) return false;
+        if (targets.isEmpty()) return false;
         for (Rect r : textBlocks) {
             if (r.contains((int) x, (int) y)) return false;
         }
@@ -606,28 +685,41 @@ public class MouseService extends AccessibilityService {
         }
     }
 
-    private void collect(AccessibilityNodeInfo n, int depth) {
-        if (n == null || depth > 60 || targets.size() > 300) return;
-        if (!n.isVisibleToUser()) return;
+    /**
+     * Collects real buttons: the innermost clickable elements (so a whole post or a list
+     * row that contains buttons doesn't count), not too big, not long text, and not
+     * full-width rows like menus. Returns true if this subtree contains anything clickable.
+     */
+    private boolean collect(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 60 || targets.size() > 300) return false;
+        if (!n.isVisibleToUser()) return false;
         Rect r = new Rect();
         n.getBoundsInScreen(r);
-        if (r.isEmpty()) return;
-        boolean clickable = n.isClickable() || n.isLongClickable() || n.isEditable();
-        float area = (float) r.width() * r.height();
-        boolean small = area < screenW * screenH * 0.5f;
-        if (clickable && small && r.width() > 6 * dp && r.height() > 6 * dp) {
-            Target t = new Target();
-            t.r.set(r);
-            t.editable = n.isEditable();
-            targets.add(t);
-        }
-        CharSequence text = n.getText();
-        if (!clickable && text != null && text.length() > 120) {
-            textBlocks.add(r);
-        }
+        if (r.isEmpty()) return false;
+
+        boolean childClickable = false;
         for (int i = 0; i < n.getChildCount(); i++) {
-            collect(n.getChild(i), depth + 1);
+            if (collect(n.getChild(i), depth + 1)) childClickable = true;
         }
+
+        boolean clickable = n.isClickable() || n.isLongClickable() || n.isEditable();
+        CharSequence text = n.getText();
+        int textLen = text == null ? 0 : text.length();
+        if (!clickable && textLen > 120) textBlocks.add(r);
+
+        if (clickable && !childClickable) {
+            boolean notTiny = r.width() > 6 * dp && r.height() > 6 * dp;
+            boolean notWide = r.width() < screenW * 0.8f || n.isEditable();
+            boolean notTall = r.height() < screenH * 0.2f;
+            boolean notText = textLen <= 40 || n.isEditable();
+            if (notTiny && notWide && notTall && notText) {
+                Target t = new Target();
+                t.r.set(r);
+                t.editable = n.isEditable();
+                targets.add(t);
+            }
+        }
+        return clickable || childClickable;
     }
 
     /** The smallest clickable element under the cursor becomes the outlined target. */
@@ -653,6 +745,7 @@ public class MouseService extends AccessibilityService {
 
     /** Where a tap lands: the middle of the outlined element, or the cursor itself. */
     private PointF tapPoint() {
+        if (SystemClock.uptimeMillis() - lastScroll < SCROLL_QUIET_MS) return new PointF(x, y);
         updateOutline();
         if (outline != null && !outlineEditable
                 && (long) outline.width() * outline.height() < (long) screenW * screenH / 3) {
@@ -707,7 +800,7 @@ public class MouseService extends AccessibilityService {
             float sy = box.top + 10 * dp;
             stillSwipe(cx, sy, cx, Math.min(box.bottom - 2, sy + dist), 380);
         }
-        targetsTime = 0;
+        noteScroll();
     }
 
     /** Finds the deepest vertically scrollable view under the cursor and its children's bounds. */
@@ -852,7 +945,8 @@ public class MouseService extends AccessibilityService {
 
     /** Two fingers moving apart (zoom in) or together (zoom out) around the cursor. */
     private void pinch(boolean zoomIn) {
-        float near = 20 * dp, far = Math.min(screenW, screenH) * 0.3f;
+        // A small step: fingers move ~28 dp each (was most of the screen).
+        float near = 30 * dp, far = near + 28 * dp;
         float a = zoomIn ? near : far, b = zoomIn ? far : near;
         float lx = x, ly = y;
         Path p1 = new Path();
@@ -862,8 +956,8 @@ public class MouseService extends AccessibilityService {
         p2.moveTo(clampX(lx + a), clampY(ly + a));
         p2.lineTo(clampX(lx + b), clampY(ly + b));
         GestureDescription.Builder g = new GestureDescription.Builder();
-        g.addStroke(new GestureDescription.StrokeDescription(p1, 0, 350));
-        g.addStroke(new GestureDescription.StrokeDescription(p2, 0, 350));
+        g.addStroke(new GestureDescription.StrokeDescription(p1, 0, 300));
+        g.addStroke(new GestureDescription.StrokeDescription(p2, 0, 300));
         dispatchGesture(g.build(), null, null);
         targetsTime = 0;
     }
@@ -965,11 +1059,11 @@ public class MouseService extends AccessibilityService {
             ring.setStrokeWidth(2 * s.dp);
             ring.setColor(Color.BLACK);
             box.setStyle(Paint.Style.STROKE);
-            box.setStrokeWidth(2.5f * s.dp);
-            box.setColor(Color.rgb(0, 229, 255));
+            box.setStrokeWidth(1.2f * s.dp);
+            box.setColor(Color.argb(120, 0, 229, 255));
             boxInner.setStyle(Paint.Style.STROKE);
-            boxInner.setStrokeWidth(1f * s.dp);
-            boxInner.setColor(Color.BLACK);
+            boxInner.setStrokeWidth(0.8f * s.dp);
+            boxInner.setColor(Color.argb(70, 0, 0, 0));
             text.setColor(Color.WHITE);
             text.setTextSize(14 * s.dp);
             bg.setColor(Color.argb(210, 0, 0, 0));
@@ -981,8 +1075,8 @@ public class MouseService extends AccessibilityService {
             c.save();
             c.translate(-loc[0], -loc[1]);
             if (s.cursorVisible()) {
-                if (s.outline != null && !s.dragging) {
-                    float in = 2 * s.dp;
+                if (s.outlineShown && s.outline != null && !s.dragging) {
+                    float in = 1.2f * s.dp;
                     c.drawRect(s.outline.left + 1, s.outline.top + 1,
                             s.outline.right - 1, s.outline.bottom - 1, box);
                     c.drawRect(s.outline.left + in, s.outline.top + in,

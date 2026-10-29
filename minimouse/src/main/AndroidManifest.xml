@@ -24,6 +24,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".AppsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".KeysActivity"
+            android:exported="false" />
+
         <service
             android:name=".MouseService"
             android:exported="true"
