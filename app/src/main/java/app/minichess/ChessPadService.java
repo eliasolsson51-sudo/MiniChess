@@ -14,6 +14,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -290,6 +291,7 @@ public class ChessPadService extends AccessibilityService {
             return;
         }
         // First tap: pick a piece.
+        Log.d("MiniChess", "pick: smart=" + smart + " sdk=" + Build.VERSION.SDK_INT);
         if (smart && Build.VERSION.SDK_INT >= 30) {
             pickWithTargets(col, row);
         } else {
@@ -318,6 +320,7 @@ public class ChessPadService extends AccessibilityService {
             pickedRow = r;
             refresh();
             if (before == null) {
+                Log.d("MiniChess", "no 'before' screenshot, smart moves skipped");
                 busy = false;
                 return;
             }
@@ -355,21 +358,32 @@ public class ChessPadService extends AccessibilityService {
     }
 
     private void findTargets(Bitmap before, Bitmap after, int pc, int pr) {
+        Log.d("MiniChess", "shots " + before.getWidth() + "x" + before.getHeight()
+                + " board " + board.toShortString());
+        StringBuilder grid = new StringBuilder();
         float sw = board.width() / 8f;
         float sh = board.height() / 8f;
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
-                if (c == pc && r == pr) continue;
+                if (c == pc && r == pr) {
+                    grid.append("   X");
+                    continue;
+                }
+                int maxDiff = 0;
                 for (float[] p : SAMPLE_POINTS) {
                     int x = (int) (board.left + (c + p[0]) * sw);
                     int y = (int) (board.top + (r + p[1]) * sh);
-                    if (pixelDiff(before, after, x, y) > DIFF_THRESHOLD) {
-                        targets.add(new int[]{c, r});
-                        break;
-                    }
+                    maxDiff = Math.max(maxDiff, pixelDiff(before, after, x, y));
                 }
+                if (maxDiff > DIFF_THRESHOLD) {
+                    targets.add(new int[]{c, r});
+                }
+                grid.append(String.format(java.util.Locale.ROOT, "%4d", maxDiff));
             }
+            Log.d("MiniChess", "row " + r + ":" + grid);
+            grid.setLength(0);
         }
+        Log.d("MiniChess", "targets found: " + targets.size());
     }
 
     private static int pixelDiff(Bitmap a, Bitmap b, int x, int y) {
@@ -405,6 +419,7 @@ public class ChessPadService extends AccessibilityService {
                         hw.recycle();
                     }
                 } catch (Exception e) {
+                    Log.d("MiniChess", "screenshot copy failed: " + e);
                     soft = null;
                 } finally {
                     hb.close();
@@ -414,6 +429,7 @@ public class ChessPadService extends AccessibilityService {
 
             @Override
             public void onFailure(int errorCode) {
+                Log.d("MiniChess", "screenshot failed, code " + errorCode + ", retries left " + retries);
                 if (retries > 0) {
                     handler.postDelayed(() -> takeShot(retries - 1, cb), 350);
                 } else {
