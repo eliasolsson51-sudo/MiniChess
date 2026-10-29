@@ -46,15 +46,15 @@ public class MainActivity extends Activity {
         help.setText(
                 "MiniChess draws a marker over the board in the chess.com app.\n\n"
                 + "In a game:\n"
-                + "  D-pad: move the marker\n"
+                + "  D-pad: move the marker (hold to move fast)\n"
                 + "  OK or 5: tap the square (piece first, then target)\n"
                 + "  After picking a piece, the D-pad jumps between its legal squares\n"
                 + "  0: free movement / clear the yellow highlight\n"
                 + "  7: smart moves on/off\n"
                 + "  #: pause / resume (menus work as normal when paused)\n"
-                + "  *: calibrate the board\n\n"
-                + "Calibrate once: open a game, press *, move the pink cross to the "
-                + "board's top-left corner, OK, then bottom-right corner, OK.");
+                + "  *: calibrate by hand (normally not needed)\n\n"
+                + "MiniChess finds the board and the pieces by itself. "
+                + "Use * only if the marker ends up in the wrong place.");
         box.addView(help);
 
         ScrollView scroll = new ScrollView(this);

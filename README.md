@@ -12,13 +12,13 @@ Play in the official chess.com app on a keypad phone with the D-pad. Games are p
 
 | Key | Action |
 | --- | --- |
-| D-pad | Move the marker |
+| D-pad | Move the marker (hold to move fast) |
 | OK / 5 | Tap the square (piece first, then target) |
 | 0 | After picking: free movement. Otherwise: clear the yellow highlight |
 | 7 | Smart moves on/off (jump only between legal squares) |
 | # | Pause / resume (menus work as normal when paused) |
-| * | Calibrate the board |
+| * | Calibrate by hand (normally not needed) |
 
-Calibrate once: open a game, press `*`, move the pink cross to the board's top-left corner and press OK, then the bottom-right corner and OK.
+MiniChess reads the board from chess.com's accessibility descriptions of each square, so it finds the board and every piece by itself and calculates the legal moves. No screenshots. If the board can't be read, press `*` and mark the board's top-left and bottom-right corners by hand.
 
 MiniChess only taps where you tell it. It never suggests moves.
