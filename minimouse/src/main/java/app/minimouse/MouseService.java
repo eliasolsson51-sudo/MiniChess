@@ -39,8 +39,8 @@ import java.util.Set;
  * A D-pad mouse cursor for any app.
  *
  *   Hold *       cursor on/off (not while the keyboard is open: TT9 uses it)
- *   D-pad        short press: one small step; hold: glide (gently slowed over
- *                buttons). Pushing against the top/bottom edge scrolls.
+ *   D-pad        short press: one small step; hold: glide. Pushing against the
+ *                top/bottom edge scrolls, faster the longer you hold.
  *   OK           finger down/up: short = tap, hold = long press.
  *                Taps the middle of the outlined element.
  *   5            long press
@@ -48,14 +48,14 @@ import java.util.Set;
  *   1            drag mode: finger down / finger up (select text, sliders, maps)
  *   7            paste into the focused text field
  *   2 / 8        previous / next post
- *   3 / 9        zoom in / out a little; hold to keep zooming
+ *   3 / 9        zoom in / out a little; hold to keep zooming.
+ *                While zoomed in, 2/4/6/8 move the view instead.
  *   4 / 6        scroll left / right; hold = swipe in from the left / right edge
  *   Back         back in the app as normal (ends a drag)
  *
  * The cursor pauses itself on the lock screen, while the keyboard is open and in apps
  * picked in the app screen. It hides while scrolling and after a few idle seconds,
- * and remembers its position per app. A faint outline marks the button under a
- * resting cursor; OK taps its middle.
+ * and remembers its position per app. Taps just beside a small button still hit it.
  */
 public class MouseService extends AccessibilityService {
 
@@ -67,10 +67,12 @@ public class MouseService extends AccessibilityService {
     private static final float HOLD_MAX_DP = 30f;
     private static final long STAR_HOLD_MS = 500;
     private static final long SIDE_HOLD_MS = 400;      // hold 4/6 = edge swipe
-    private static final long EDGE_SCROLL_EVERY_MS = 260;
+    private static final long EDGE_SCROLL_EVERY_MS = 210;
     private static final long IDLE_HIDE_MS = 4000;
     private static final long TARGETS_MAX_AGE_MS = 400;
-    private static final float MAGNET = 0.45f;         // speed factor over a button while gliding
+    private static final boolean SHOW_OUTLINE = false; // invisible help: no outline
+    private static final float FORGIVE_DP = 12f;       // OK still hits a small button this close
+    private static final long PAN_REPEAT_MS = 280;     // hold 2/4/6/8 while zoomed
     private static final long OUTLINE_DELAY_MS = 350;  // outline appears once the cursor rests
     private static final long SCROLL_QUIET_MS = 600;   // cursor/outline hidden after a scroll
     private static final long ZOOM_REPEAT_MS = 380;    // hold 3/9
@@ -132,7 +134,6 @@ public class MouseService extends AccessibilityService {
             if (holdKey < 0) return;
             holdSteps++;
             float speed = Math.min(HOLD_MAX_DP, HOLD_START_DP + holdSteps * HOLD_RAMP_DP) * dp;
-            if (!dragging && overButton()) speed *= MAGNET; // gentle magnet while gliding
             moveBy(holdDx * speed, holdDy * speed, holdDy);
             noteActivity();
             handler.postDelayed(this, HOLD_INTERVAL_MS);
@@ -176,11 +177,24 @@ public class MouseService extends AccessibilityService {
     };
 
     private final Runnable showOutline = () -> {
+        if (!SHOW_OUTLINE) return;
         if (holdKey >= 0 || dragging || scrollHidden) return;
         if (SystemClock.uptimeMillis() - lastScroll < SCROLL_QUIET_MS) return;
         updateOutline();
         outlineShown = outline != null;
         if (pointer != null) pointer.invalidate();
+    };
+
+    // Zoom level from 3/9 (0 = not zoomed). While zoomed, 2/4/6/8 move the view.
+    private int zoomLevel = 0;
+    private int panKey = -1;
+    private final Runnable panRepeat = new Runnable() {
+        @Override
+        public void run() {
+            if (panKey < 0) return;
+            pan(panKey);
+            handler.postDelayed(this, PAN_REPEAT_MS);
+        }
     };
 
     // Hold 3/9 = keep zooming.
@@ -261,6 +275,7 @@ public class MouseService extends AccessibilityService {
         if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 || t == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
             targetsTime = 0; // screen changed: re-read clickables next time
+            if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) zoomLevel = 0;
             updateSuspended();
         }
     }
@@ -428,6 +443,22 @@ public class MouseService extends AccessibilityService {
             return true;
         }
 
+        // Zoomed in: 2/4/6/8 move the view (hold to keep moving).
+        boolean isPanKey = code == KeyEvent.KEYCODE_2 || code == KeyEvent.KEYCODE_8
+                || code == KeyEvent.KEYCODE_4 || code == KeyEvent.KEYCODE_6;
+        if (isPanKey && (zoomLevel > 0 || panKey == code)) {
+            if (firstDown) {
+                panKey = code;
+                pan(code);
+                handler.removeCallbacks(panRepeat);
+                handler.postDelayed(panRepeat, PAN_REPEAT_MS + 120);
+            } else if (!down && code == panKey) {
+                panKey = -1;
+                handler.removeCallbacks(panRepeat);
+            }
+            return true;
+        }
+
         // 4/6: decide on release (short = scroll) or after a while (hold = edge swipe).
         if (code == KeyEvent.KEYCODE_4 || code == KeyEvent.KEYCODE_6) {
             if (firstDown) {
@@ -584,6 +615,8 @@ public class MouseService extends AccessibilityService {
         handler.removeCallbacks(holdStep);
         handler.removeCallbacks(zoomRepeat);
         zoomKey = -1;
+        handler.removeCallbacks(panRepeat);
+        panKey = -1;
     }
 
     // ---------------------------------------------------------------- moving
@@ -643,14 +676,16 @@ public class MouseService extends AccessibilityService {
         long now = SystemClock.uptimeMillis();
         if (now - lastEdgeScroll < EDGE_SCROLL_EVERY_MS) return;
         lastEdgeScroll = now;
-        float dist = screenH * 0.18f + touchSlop;
+        // Faster the longer you hold: from about a quarter to almost half a screen per step.
+        float ramp = Math.min(1f, holdSteps / 40f);
+        float dist = screenH * (0.24f + 0.2f * ramp) + touchSlop;
         float cx = x;
         if (dir > 0) {
-            float sy = screenH * 0.75f;
-            stillSwipe(cx, sy, cx, sy - dist, 220);
+            float sy = screenH * 0.82f;
+            stillSwipe(cx, sy, cx, Math.max(2, sy - dist), 170);
         } else {
-            float sy = screenH * 0.25f;
-            stillSwipe(cx, sy, cx, sy + dist, 220);
+            float sy = screenH * 0.18f;
+            stillSwipe(cx, sy, cx, Math.min(screenH - 2, sy + dist), 170);
         }
         noteScroll();
     }
@@ -743,15 +778,34 @@ public class MouseService extends AccessibilityService {
         outlineEditable = editable;
     }
 
-    /** Where a tap lands: the middle of the outlined element, or the cursor itself. */
+    /**
+     * Where a tap lands. Exactly at the cursor when it is on a button (or over nothing),
+     * but if the cursor is just beside a small button, the tap goes to that button.
+     */
     private PointF tapPoint() {
         if (SystemClock.uptimeMillis() - lastScroll < SCROLL_QUIET_MS) return new PointF(x, y);
-        updateOutline();
-        if (outline != null && !outlineEditable
-                && (long) outline.width() * outline.height() < (long) screenW * screenH / 3) {
-            return new PointF(outline.exactCenterX(), outline.exactCenterY());
+        targetsTime = 0;
+        refreshTargets(false);
+        int cx = (int) x, cy = (int) y;
+        for (Target t : targets) {
+            if (t.r.contains(cx, cy)) return new PointF(x, y); // already on it
         }
-        return new PointF(x, y);
+        float limit = FORGIVE_DP * dp;
+        Target best = null;
+        float bestD = Float.MAX_VALUE;
+        for (Target t : targets) {
+            // Only small things (icons, buttons, links) get this help.
+            if (t.r.width() > screenW * 0.5f || t.r.height() > 80 * dp) continue;
+            float dx = Math.max(Math.max(t.r.left - x, 0), x - t.r.right);
+            float dy = Math.max(Math.max(t.r.top - y, 0), y - t.r.bottom);
+            float d = (float) Math.hypot(dx, dy);
+            if (d <= limit && d < bestD) {
+                bestD = d;
+                best = t;
+            }
+        }
+        if (best == null) return new PointF(x, y);
+        return new PointF(best.r.exactCenterX(), best.r.exactCenterY());
     }
 
     // ---------------------------------------------------------------- smart scroll
@@ -912,6 +966,20 @@ public class MouseService extends AccessibilityService {
         dispatch(new GestureDescription.StrokeDescription(p, 0, durationMs));
     }
 
+    /** Moves a zoomed-in view: the finger drags from the middle of the screen. */
+    private void pan(int key) {
+        float cx = screenW / 2f, cy = screenH / 2f;
+        float dh = screenW * 0.3f, dv = screenH * 0.25f;
+        switch (key) {
+            case KeyEvent.KEYCODE_8: stillSwipe(cx, cy + dv / 2, cx, cy - dv / 2, 200); break; // see lower part
+            case KeyEvent.KEYCODE_2: stillSwipe(cx, cy - dv / 2, cx, cy + dv / 2, 200); break; // see upper part
+            case KeyEvent.KEYCODE_6: stillSwipe(cx + dh / 2, cy, cx - dh / 2, cy, 200); break; // see right side
+            case KeyEvent.KEYCODE_4: stillSwipe(cx - dh / 2, cy, cx + dh / 2, cy, 200); break; // see left side
+            default: break;
+        }
+        noteScroll();
+    }
+
     /** Swipe in from the screen edge (opens side menus in many apps). */
     private void edgeSwipe(boolean fromLeft) {
         float sy = y;
@@ -945,6 +1013,7 @@ public class MouseService extends AccessibilityService {
 
     /** Two fingers moving apart (zoom in) or together (zoom out) around the cursor. */
     private void pinch(boolean zoomIn) {
+        zoomLevel = zoomIn ? zoomLevel + 1 : Math.max(0, zoomLevel - 1);
         // A small step: fingers move ~28 dp each (was most of the screen).
         float near = 30 * dp, far = near + 28 * dp;
         float a = zoomIn ? near : far, b = zoomIn ? far : near;
