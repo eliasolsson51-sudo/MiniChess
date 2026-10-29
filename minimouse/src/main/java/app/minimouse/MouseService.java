@@ -8,56 +8,67 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
-import android.util.Log;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
  * A D-pad mouse cursor for any app.
  *
- *   Hold *       cursor on/off (not while the keyboard is open, so TT9 works as normal)
- *   D-pad        move (hold to speed up)
+ *   Hold *       cursor on/off
+ *   D-pad        move (hold to speed up); pushing against the top/bottom edge scrolls
  *   OK           tap
  *   5            long press
- *   2 / 8        scroll up / down
+ *   1            drag mode: finger down / finger up (select text, move sliders and maps)
+ *   2 / 8        smart scroll: previous / next post
  *   4 / 6        scroll left / right
- *   Back         cursor off
+ *   3 / 9        zoom in / out
+ *   0            double tap
+ *   7            paste into the focused text field
+ *   Back         cursor off (or finger up when dragging)
  */
 public class MouseService extends AccessibilityService {
 
-    private static final long HOLD_DELAY_MS = 180;
+    private static final long HOLD_DELAY_MS = 150;
     private static final long HOLD_INTERVAL_MS = 30;
+    private static final float STEP_DP = 10f;          // one press
+    private static final float HOLD_START_DP = 6f;     // per 30 ms when held
+    private static final float HOLD_RAMP_DP = 1.5f;
+    private static final float HOLD_MAX_DP = 30f;
+    private static final long STAR_HOLD_MS = 500;
+    private static final long EDGE_SCROLL_EVERY_MS = 260;
 
     private WindowManager wm;
     private Pointer pointer;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private boolean active = false;
+    boolean active = false;
     float x, y;
-    private float dp;
+    float dp;
     private int screenW, screenH;
+    private int touchSlop;
 
-    // * long-press detection: a timer, so it works even if the phone sends no key repeats.
-    private static final long STAR_HOLD_MS = 500;
+    // * long-press detection (timer based, works without key repeats).
     private boolean starDown = false;
     private boolean starConsumed = false;
     private final Runnable starHeld = () -> {
         if (!starDown || starConsumed) return;
-        boolean kb = keyboardOpen();
-        Log.d("MiniMouse", "* held, keyboard open: " + kb);
-        if (!kb) {
-            starConsumed = true;
-            setActive(!active);
-        }
+        starConsumed = true;
+        setActive(!active);
     };
 
     // Held D-pad direction.
@@ -69,17 +80,21 @@ public class MouseService extends AccessibilityService {
         public void run() {
             if (holdKey < 0) return;
             holdSteps++;
-            // Speed ramps up from 4 dp to 22 dp per step.
-            float speed = Math.min(22f, 4f + holdSteps * 0.6f) * dp;
-            moveBy(holdDx * speed, holdDy * speed);
+            float speed = Math.min(HOLD_MAX_DP, HOLD_START_DP + holdSteps * HOLD_RAMP_DP) * dp;
+            moveBy(holdDx * speed, holdDy * speed, holdDy);
             handler.postDelayed(this, HOLD_INTERVAL_MS);
         }
     };
+    private long lastEdgeScroll = 0;
+
+    // Drag mode: the "finger" stays down between gestures.
+    boolean dragging = false;
+    private GestureDescription.StrokeDescription dragStroke;
+    private float dragX, dragY;
 
     String toast = null;
     private final Runnable hideToast = () -> {
         toast = null;
-        if (pointer != null) pointer.invalidate();
         updateVisibility();
     };
 
@@ -91,6 +106,7 @@ public class MouseService extends AccessibilityService {
         dp = dm.density;
         screenW = dm.widthPixels;
         screenH = dm.heightPixels;
+        touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
         x = screenW / 2f;
         y = screenH / 2f;
 
@@ -141,9 +157,6 @@ public class MouseService extends AccessibilityService {
         boolean down = ev.getAction() == KeyEvent.ACTION_DOWN;
         boolean firstDown = down && ev.getRepeatCount() == 0;
 
-        Log.d("MiniMouse", "key " + code + " " + KeyEvent.keyCodeToString(code)
-                + (down ? " down" : " up") + " repeat " + ev.getRepeatCount());
-
         // Hold * = toggle. A short press still reaches the app as normal.
         if (code == KeyEvent.KEYCODE_STAR) {
             if (firstDown) {
@@ -153,9 +166,7 @@ public class MouseService extends AccessibilityService {
                 handler.postDelayed(starHeld, STAR_HOLD_MS);
                 return false;
             }
-            if (down) {
-                return starConsumed; // repeats: swallow once the toggle happened
-            }
+            if (down) return starConsumed;
             starDown = false;
             handler.removeCallbacks(starHeld);
             if (starConsumed) {
@@ -177,7 +188,7 @@ public class MouseService extends AccessibilityService {
         }
         if (dx != 0 || dy != 0) {
             if (firstDown) {
-                moveBy(dx * 4 * dp, dy * 4 * dp);
+                moveBy(dx * STEP_DP * dp, dy * STEP_DP * dp, dy);
                 startHold(code, dx, dy);
             } else if (!down && code == holdKey) {
                 stopHold();
@@ -185,61 +196,93 @@ public class MouseService extends AccessibilityService {
             return true;
         }
 
+        if (!firstDown) {
+            // Swallow repeats and key-ups of the keys we handle below.
+            return isMouseKey(code);
+        }
+
         switch (code) {
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
             case KeyEvent.KEYCODE_NUMPAD_ENTER:
-                if (firstDown) {
-                    stopHold();
-                    tap(60);
-                }
+                stopHold();
+                if (dragging) endDrag();
+                else tap(60);
                 return true;
             case KeyEvent.KEYCODE_5:
-                if (firstDown) tap(700);
+                tap(700);
+                return true;
+            case KeyEvent.KEYCODE_1:
+                if (dragging) endDrag();
+                else startDrag();
                 return true;
             case KeyEvent.KEYCODE_2:
-                if (firstDown) swipe(0, 1);   // finger down = content scrolls up
+                smartScroll(-1);
                 return true;
             case KeyEvent.KEYCODE_8:
-                if (firstDown) swipe(0, -1);
+                smartScroll(1);
                 return true;
             case KeyEvent.KEYCODE_4:
-                if (firstDown) swipe(1, 0);
+                swipe(x, y, Math.min(screenW - 2, x + screenW * 0.35f), y, 250);
                 return true;
             case KeyEvent.KEYCODE_6:
-                if (firstDown) swipe(-1, 0);
+                swipe(x, y, Math.max(1, x - screenW * 0.35f), y, 250);
+                return true;
+            case KeyEvent.KEYCODE_3:
+                pinch(true);
+                return true;
+            case KeyEvent.KEYCODE_9:
+                pinch(false);
+                return true;
+            case KeyEvent.KEYCODE_0:
+                doubleTap();
+                return true;
+            case KeyEvent.KEYCODE_7:
+                paste();
                 return true;
             case KeyEvent.KEYCODE_BACK:
-                if (firstDown) setActive(false);
+                if (dragging) endDrag();
+                else setActive(false);
                 return true;
             default:
                 return false;
         }
     }
 
-    private boolean keyboardOpen() {
-        try {
-            List<AccessibilityWindowInfo> windows = getWindows();
-            for (AccessibilityWindowInfo w : windows) {
-                if (w.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return true;
-            }
-        } catch (Exception ignored) {
+    private static boolean isMouseKey(int code) {
+        switch (code) {
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER:
+            case KeyEvent.KEYCODE_0:
+            case KeyEvent.KEYCODE_1:
+            case KeyEvent.KEYCODE_2:
+            case KeyEvent.KEYCODE_3:
+            case KeyEvent.KEYCODE_4:
+            case KeyEvent.KEYCODE_5:
+            case KeyEvent.KEYCODE_6:
+            case KeyEvent.KEYCODE_7:
+            case KeyEvent.KEYCODE_8:
+            case KeyEvent.KEYCODE_9:
+            case KeyEvent.KEYCODE_BACK:
+                return true;
+            default:
+                return false;
         }
-        return false;
     }
 
     private void setActive(boolean on) {
+        if (!on && dragging) endDrag();
         active = on;
         stopHold();
         showToast(on ? "Mus på  (håll * = av)" : "Mus av");
-        updateVisibility();
     }
 
     private void showToast(String msg) {
         toast = msg;
         handler.removeCallbacks(hideToast);
         handler.postDelayed(hideToast, 1300);
-        if (pointer != null) pointer.invalidate();
+        updateVisibility();
     }
 
     private void updateVisibility() {
@@ -262,10 +305,140 @@ public class MouseService extends AccessibilityService {
         handler.removeCallbacks(holdStep);
     }
 
-    private void moveBy(float ddx, float ddy) {
+    /** Moves the cursor; pushing against the top or bottom edge scrolls the page instead. */
+    private void moveBy(float ddx, float ddy, int dirY) {
+        float margin = 2 * dp;
+        boolean atBottom = y >= screenH - 1 - margin;
+        boolean atTop = y <= margin;
+        if (!dragging && ((dirY > 0 && atBottom) || (dirY < 0 && atTop))) {
+            edgeScroll(dirY);
+            return;
+        }
         x = Math.max(0, Math.min(screenW - 1, x + ddx));
         y = Math.max(0, Math.min(screenH - 1, y + ddy));
+        if (dragging) dragTo(x, y);
         if (pointer != null) pointer.invalidate();
+    }
+
+    private void edgeScroll(int dir) {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastEdgeScroll < EDGE_SCROLL_EVERY_MS) return;
+        lastEdgeScroll = now;
+        float dist = screenH * 0.18f + touchSlop;
+        float cx = x;
+        if (dir > 0) {
+            float sy = screenH * 0.75f;
+            stillSwipe(cx, sy, cx, sy - dist, 220);
+        } else {
+            float sy = screenH * 0.25f;
+            stillSwipe(cx, sy, cx, sy + dist, 220);
+        }
+    }
+
+    // ---------------------------------------------------------------- smart scroll
+
+    /**
+     * Scrolls the list under the cursor so the next post starts at the top (dir = 1),
+     * or back to the start of the current / previous post (dir = -1).
+     */
+    private void smartScroll(int dir) {
+        Rect box = new Rect();
+        List<Rect> kids = new ArrayList<>();
+        boolean found = findScrollable(box, kids);
+
+        if (!found) {
+            box.set(0, 0, screenW, screenH);
+        }
+        float top = box.top, h = box.height();
+        float maxDist = h - 24 * dp;
+        float dist = 0;
+
+        if (found && !kids.isEmpty()) {
+            float gap = 6 * dp;
+            if (dir > 0) {
+                // First item that starts below the top of the list.
+                for (Rect k : kids) {
+                    if (k.top > top + gap) {
+                        dist = k.top - top;
+                        break;
+                    }
+                }
+            } else {
+                // Start of the item cut off at the top, if any.
+                for (Rect k : kids) {
+                    if (k.top < top - gap && k.bottom > top + gap) {
+                        dist = top - k.top;
+                    }
+                }
+            }
+        }
+        // Long posts (or no item found): scroll most of a screen.
+        if (dist <= 0 || dist > maxDist) dist = h * 0.6f;
+
+        float cx = box.exactCenterX();
+        dist += touchSlop;
+        if (dir > 0) {
+            float sy = box.bottom - 10 * dp;
+            stillSwipe(cx, sy, cx, Math.max(box.top + 2, sy - dist), 380);
+        } else {
+            float sy = box.top + 10 * dp;
+            stillSwipe(cx, sy, cx, Math.min(box.bottom - 2, sy + dist), 380);
+        }
+    }
+
+    /** Finds the deepest vertically scrollable view under the cursor and its children's bounds. */
+    private boolean findScrollable(Rect outBox, List<Rect> outKids) {
+        List<AccessibilityNodeInfo> roots = new ArrayList<>();
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                if (w.getType() == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue;
+                Rect wb = new Rect();
+                w.getBoundsInScreen(wb);
+                if (!wb.contains((int) x, (int) y)) continue;
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r != null) roots.add(r);
+            }
+        } catch (Exception ignored) {
+        }
+        if (roots.isEmpty()) {
+            AccessibilityNodeInfo r = getRootInActiveWindow();
+            if (r != null) roots.add(r);
+        }
+        AccessibilityNodeInfo best = null;
+        for (AccessibilityNodeInfo r : roots) {
+            AccessibilityNodeInfo n = deepestScrollable(r, 0);
+            if (n != null) {
+                best = n;
+                break;
+            }
+        }
+        if (best == null) return false;
+        best.getBoundsInScreen(outBox);
+        for (int i = 0; i < best.getChildCount(); i++) {
+            AccessibilityNodeInfo c = best.getChild(i);
+            if (c == null) continue;
+            Rect r = new Rect();
+            c.getBoundsInScreen(r);
+            if (r.height() > 4 * dp) outKids.add(r);
+        }
+        outKids.sort((a, b) -> Integer.compare(a.top, b.top));
+        return true;
+    }
+
+    private AccessibilityNodeInfo deepestScrollable(AccessibilityNodeInfo node, int depth) {
+        if (node == null || depth > 45) return null;
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+        if (!r.contains((int) x, (int) y)) return null;
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo found = deepestScrollable(node.getChild(i), depth + 1);
+            if (found != null) return found;
+        }
+        // Skip horizontal-only scrollers (carousels): they are wider than tall.
+        if (node.isScrollable() && r.height() > 80 * dp && r.height() >= r.width() * 0.5f) {
+            return node;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------- gestures
@@ -273,25 +446,137 @@ public class MouseService extends AccessibilityService {
     private void tap(long durationMs) {
         Path p = new Path();
         p.moveTo(x, y);
-        dispatch(p, durationMs);
+        dispatch(new GestureDescription.StrokeDescription(p, 0, durationMs));
     }
 
-    /** Swipes from the cursor in the given direction (a finger movement). */
-    private void swipe(int dirX, int dirY) {
-        float dist = (dirY != 0 ? screenH : screenW) * 0.35f;
-        float sx = x, sy = y;
-        float ex = Math.max(1, Math.min(screenW - 2, sx + dirX * dist));
-        float ey = Math.max(1, Math.min(screenH - 2, sy + dirY * dist));
+    private void doubleTap() {
+        Path p1 = new Path();
+        p1.moveTo(x, y);
+        Path p2 = new Path();
+        p2.moveTo(x, y);
+        GestureDescription.Builder b = new GestureDescription.Builder();
+        b.addStroke(new GestureDescription.StrokeDescription(p1, 0, 40));
+        b.addStroke(new GestureDescription.StrokeDescription(p2, 120, 40));
+        dispatchGesture(b.build(), null, null);
+    }
+
+    private void swipe(float sx, float sy, float ex, float ey, long durationMs) {
         Path p = new Path();
         p.moveTo(sx, sy);
         p.lineTo(ex, ey);
-        dispatch(p, 250);
+        dispatch(new GestureDescription.StrokeDescription(p, 0, durationMs));
     }
 
-    private void dispatch(Path path, long durationMs) {
-        GestureDescription.StrokeDescription stroke =
-                new GestureDescription.StrokeDescription(path, 0, durationMs);
+    /** A swipe that stops and rests before lifting, so the page doesn't keep gliding. */
+    private void stillSwipe(float sx, float sy, float ex, float ey, long durationMs) {
+        if (Build.VERSION.SDK_INT < 26) {
+            swipe(sx, sy, ex, ey, durationMs);
+            return;
+        }
+        Path move = new Path();
+        move.moveTo(sx, sy);
+        move.lineTo(ex, ey);
+        final GestureDescription.StrokeDescription first =
+                new GestureDescription.StrokeDescription(move, 0, durationMs, true);
+        dispatchGesture(new GestureDescription.Builder().addStroke(first).build(),
+                new GestureResultCallback() {
+                    @Override
+                    public void onCompleted(GestureDescription gestureDescription) {
+                        Path rest = new Path();
+                        rest.moveTo(ex, ey);
+                        dispatch(first.continueStroke(rest, 0, 120, false));
+                    }
+                }, null);
+    }
+
+    /** Two fingers moving apart (zoom in) or together (zoom out) around the cursor. */
+    private void pinch(boolean zoomIn) {
+        float near = 20 * dp, far = Math.min(screenW, screenH) * 0.3f;
+        float a = zoomIn ? near : far, b = zoomIn ? far : near;
+        float lx = x, ly = y;
+        Path p1 = new Path();
+        p1.moveTo(clampX(lx - a), clampY(ly - a));
+        p1.lineTo(clampX(lx - b), clampY(ly - b));
+        Path p2 = new Path();
+        p2.moveTo(clampX(lx + a), clampY(ly + a));
+        p2.lineTo(clampX(lx + b), clampY(ly + b));
+        GestureDescription.Builder g = new GestureDescription.Builder();
+        g.addStroke(new GestureDescription.StrokeDescription(p1, 0, 350));
+        g.addStroke(new GestureDescription.StrokeDescription(p2, 0, 350));
+        dispatchGesture(g.build(), null, null);
+    }
+
+    private float clampX(float v) {
+        return Math.max(1, Math.min(screenW - 2, v));
+    }
+
+    private float clampY(float v) {
+        return Math.max(1, Math.min(screenH - 2, v));
+    }
+
+    // ---------------------------------------------------------------- drag
+
+    private void startDrag() {
+        if (Build.VERSION.SDK_INT < 26) {
+            showToast("Dra kräver Android 8+");
+            return;
+        }
+        Path p = new Path();
+        p.moveTo(x, y);
+        // Long press so text gets selected and things become draggable.
+        dragStroke = new GestureDescription.StrokeDescription(p, 0, 600, true);
+        dragX = x;
+        dragY = y;
+        dragging = true;
+        dispatch(dragStroke);
+        showToast("Dra: flytta och tryck 1 för att släppa");
+    }
+
+    private void dragTo(float nx, float ny) {
+        if (dragStroke == null || Build.VERSION.SDK_INT < 26) return;
+        if (Math.abs(nx - dragX) < 0.5f && Math.abs(ny - dragY) < 0.5f) return;
+        Path p = new Path();
+        p.moveTo(dragX, dragY);
+        p.lineTo(nx, ny);
+        try {
+            dragStroke = dragStroke.continueStroke(p, 0, HOLD_INTERVAL_MS, true);
+            dispatch(dragStroke);
+        } catch (Exception e) {
+            dragging = false;
+            dragStroke = null;
+        }
+        dragX = nx;
+        dragY = ny;
+    }
+
+    private void endDrag() {
+        if (dragStroke != null && Build.VERSION.SDK_INT >= 26) {
+            Path p = new Path();
+            p.moveTo(dragX, dragY);
+            try {
+                dispatch(dragStroke.continueStroke(p, 0, 40, false));
+            } catch (Exception ignored) {
+            }
+        }
+        dragStroke = null;
+        dragging = false;
+        if (pointer != null) pointer.invalidate();
+    }
+
+    private void dispatch(GestureDescription.StrokeDescription stroke) {
         dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
+    }
+
+    // ---------------------------------------------------------------- paste
+
+    private void paste() {
+        AccessibilityNodeInfo field = findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+        if (field != null && field.isEditable()) {
+            field.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+            showToast("Inklistrat");
+        } else {
+            showToast("Tryck först i ett textfält");
+        }
     }
 
     // ---------------------------------------------------------------- overlay
@@ -299,6 +584,7 @@ public class MouseService extends AccessibilityService {
     private static class Pointer extends View {
         private final MouseService s;
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dragFill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint bg = new Paint();
@@ -308,6 +594,7 @@ public class MouseService extends AccessibilityService {
             super(service);
             s = service;
             fill.setColor(Color.argb(170, 0, 229, 255));
+            dragFill.setColor(Color.argb(190, 255, 140, 0));
             ring.setStyle(Paint.Style.STROKE);
             ring.setStrokeWidth(2 * s.dp);
             ring.setColor(Color.BLACK);
@@ -323,7 +610,7 @@ public class MouseService extends AccessibilityService {
             c.translate(-loc[0], -loc[1]);
             if (s.active) {
                 float r = 7 * s.dp;
-                c.drawCircle(s.x, s.y, r, fill);
+                c.drawCircle(s.x, s.y, r, s.dragging ? dragFill : fill);
                 c.drawCircle(s.x, s.y, r, ring);
                 c.drawCircle(s.x, s.y, 1.5f * s.dp, ring);
             }

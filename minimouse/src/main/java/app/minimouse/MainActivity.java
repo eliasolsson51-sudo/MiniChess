@@ -36,12 +36,17 @@ public class MainActivity extends Activity {
         help.setPadding(0, pad, 0, 0);
         help.setText("Hold *: cursor on/off\n"
                 + "D-pad: move (hold to speed up)\n"
+                + "Push against the top/bottom edge: scroll\n"
                 + "OK: tap\n"
                 + "5: long press\n"
-                + "2 / 8: scroll up / down\n"
+                + "1: drag mode on/off (select text, sliders, maps)\n"
+                + "2 / 8: previous / next post\n"
                 + "4 / 6: scroll left / right\n"
+                + "3 / 9: zoom in / out\n"
+                + "0: double tap\n"
+                + "7: paste into the text field\n"
                 + "Back: cursor off\n\n"
-                + "Holding * does nothing while the keyboard is open, so typing works as normal.");
+                + "While the cursor is on it uses the number keys, so turn it off (hold *) to type.");
         box.addView(help);
 
         ScrollView scroll = new ScrollView(this);
