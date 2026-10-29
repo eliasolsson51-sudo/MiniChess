@@ -26,13 +26,17 @@ jobs:
       - name: Build
         run: gradle assembleRelease --no-daemon
 
-      - name: Rename APK
-        run: cp app/build/outputs/apk/release/app-release.apk MiniChess.apk
+      - name: Rename APKs
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk MiniChess.apk
+          cp autodark/build/outputs/apk/release/autodark-release.apk AutoDark.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: MiniChess build ${{ github.run_number }}
-          files: MiniChess.apk
+          files: |
+            MiniChess.apk
+            AutoDark.apk
           make_latest: true
