@@ -30,6 +30,7 @@ jobs:
         run: |
           cp app/build/outputs/apk/release/app-release.apk MiniChess.apk
           cp autodark/build/outputs/apk/release/autodark-release.apk AutoDark.apk
+          cp minisettings/build/outputs/apk/release/minisettings-release.apk MiniSettings.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -39,4 +40,5 @@ jobs:
           files: |
             MiniChess.apk
             AutoDark.apk
+            MiniSettings.apk
           make_latest: true

@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+def runNumber = (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as Integer
+
+android {
+    namespace 'app.minisettings'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'app.minisettings'
+        minSdk 24
+        targetSdk 28   // 28 = the app may still switch wifi and Bluetooth itself
+        versionCode runNumber
+        versionName "0.1.${runNumber}"
+    }
+
+    signingConfigs {
+        shared {
+            storeFile rootProject.file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.shared
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.shared
+        }
+    }
+
+    // Old targetSdk on purpose (see above); lint would refuse it.
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
