@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MiniMouse</string>
+    <string name="service_desc">A D-pad mouse cursor for any app. Hold * to turn it on or off.</string>
+</resources>

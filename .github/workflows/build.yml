@@ -31,6 +31,7 @@ jobs:
           cp app/build/outputs/apk/release/app-release.apk MiniChess.apk
           cp autodark/build/outputs/apk/release/autodark-release.apk AutoDark.apk
           cp minisettings/build/outputs/apk/release/minisettings-release.apk MiniSettings.apk
+          cp minimouse/build/outputs/apk/release/minimouse-release.apk MiniMouse.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -41,4 +42,5 @@ jobs:
             MiniChess.apk
             AutoDark.apk
             MiniSettings.apk
+            MiniMouse.apk
           make_latest: true
