@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MiniChess</string>
+    <string name="service_desc">Lets you play in the chess.com app with the D-pad: a marker moves over the board and OK taps the square. # pauses, * calibrates the board.</string>
+</resources>
