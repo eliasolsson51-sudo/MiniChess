@@ -11,6 +11,7 @@ import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -45,8 +46,19 @@ public class MouseService extends AccessibilityService {
     private float dp;
     private int screenW, screenH;
 
-    // * long-press detection.
+    // * long-press detection: a timer, so it works even if the phone sends no key repeats.
+    private static final long STAR_HOLD_MS = 500;
+    private boolean starDown = false;
     private boolean starConsumed = false;
+    private final Runnable starHeld = () -> {
+        if (!starDown || starConsumed) return;
+        boolean kb = keyboardOpen();
+        Log.d("MiniMouse", "* held, keyboard open: " + kb);
+        if (!kb) {
+            starConsumed = true;
+            setActive(!active);
+        }
+    };
 
     // Held D-pad direction.
     private int holdKey = -1;
@@ -129,20 +141,24 @@ public class MouseService extends AccessibilityService {
         boolean down = ev.getAction() == KeyEvent.ACTION_DOWN;
         boolean firstDown = down && ev.getRepeatCount() == 0;
 
+        Log.d("MiniMouse", "key " + code + " " + KeyEvent.keyCodeToString(code)
+                + (down ? " down" : " up") + " repeat " + ev.getRepeatCount());
+
         // Hold * = toggle. A short press still reaches the app as normal.
         if (code == KeyEvent.KEYCODE_STAR) {
             if (firstDown) {
+                starDown = true;
                 starConsumed = false;
+                handler.removeCallbacks(starHeld);
+                handler.postDelayed(starHeld, STAR_HOLD_MS);
                 return false;
             }
-            if (down && ev.getRepeatCount() >= 1) {
-                if (!starConsumed && !keyboardOpen()) {
-                    starConsumed = true;
-                    setActive(!active);
-                }
-                return starConsumed;
+            if (down) {
+                return starConsumed; // repeats: swallow once the toggle happened
             }
-            if (!down && starConsumed) {
+            starDown = false;
+            handler.removeCallbacks(starHeld);
+            if (starConsumed) {
                 starConsumed = false;
                 return true;
             }
