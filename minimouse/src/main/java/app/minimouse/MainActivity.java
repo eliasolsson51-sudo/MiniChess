@@ -45,7 +45,7 @@ public class MainActivity extends Activity {
                 + "3 / 9: zoom in / out\n"
                 + "0: double tap\n"
                 + "7: paste into the text field\n"
-                + "Back: cursor off\n\n"
+                + "Back: back in the app as normal\n\n"
                 + "Holding * does nothing while the keyboard is open, so TT9 works as normal.");
         box.addView(help);
 

@@ -39,7 +39,7 @@ import java.util.List;
  *   3 / 9        zoom in / out
  *   0            double tap
  *   7            paste into the focused text field
- *   Back         cursor off (or finger up when dragging)
+ *   Back         back in the app as normal (ends a drag)
  */
 public class MouseService extends AccessibilityService {
 
@@ -253,9 +253,12 @@ public class MouseService extends AccessibilityService {
                 paste();
                 return true;
             case KeyEvent.KEYCODE_BACK:
-                if (dragging) endDrag();
-                else setActive(false);
-                return true;
+                // Back works as normal in the app; it only ends a drag.
+                if (dragging) {
+                    endDrag();
+                    return true;
+                }
+                return false;
             default:
                 return false;
         }
@@ -276,7 +279,6 @@ public class MouseService extends AccessibilityService {
             case KeyEvent.KEYCODE_7:
             case KeyEvent.KEYCODE_8:
             case KeyEvent.KEYCODE_9:
-            case KeyEvent.KEYCODE_BACK:
                 return true;
             default:
                 return false;
