@@ -74,13 +74,23 @@ class OverlayView extends View {
                     b.left + (s.pickedCol + 1) * sw, b.top + (s.pickedRow + 1) * sh, picked);
         }
 
+        // Small cyan dots on the legal squares while a piece is picked.
+        if (s.targetMode) {
+            for (int[] tg : s.targets) {
+                canvas.drawCircle(b.left + (tg[0] + 0.5f) * sw, b.top + (tg[1] + 0.5f) * sh,
+                        3 * dp, outer);
+            }
+        }
+
         float l = b.left + s.col * sw, t = b.top + s.row * sh;
         float pad = 2 * dp;
         canvas.drawRect(l + pad, t + pad, l + sw - pad, t + sh - pad, outer);
         float in = 4.5f * dp;
         canvas.drawRect(l + in, t + in, l + sw - in, t + sh - in, inner);
 
-        if (!s.calibrated) {
+        if (s.showToast != null) {
+            label(canvas, s.showToast, 8 * dp, 8 * dp);
+        } else if (!s.calibrated) {
             label(canvas, "Press * to calibrate the board", 8 * dp, 8 * dp);
         }
     }

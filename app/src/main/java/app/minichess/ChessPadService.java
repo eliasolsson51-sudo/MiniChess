@@ -2,27 +2,43 @@ package app.minichess;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
+import android.hardware.HardwareBuffer;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.DisplayMetrics;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
 /**
  * Draws a square marker over the chess.com board and turns key presses into taps.
  *
  * Keys while chess.com is in front:
- *   D-pad        move the marker one square
+ *   D-pad        move the marker (after picking a piece: jump between its legal squares)
  *   OK / 5       tap the marked square (tap a piece, then tap where it should go)
- *   0            clear the "picked piece" highlight
+ *   7            smart moves on/off
+ *   0            after picking: free movement; otherwise clear the yellow highlight
  *   #            pause / resume (when paused, all keys go to chess.com as normal)
  *   *            calibrate: mark the board's top-left, then bottom-right corner
+ *
+ * Legal squares are found by comparing a screenshot taken just before the piece is
+ * tapped with one taken just after: the squares where chess.com drew a move dot or a
+ * capture ring are the ones that changed.
  */
 public class ChessPadService extends AccessibilityService {
 
@@ -33,9 +49,18 @@ public class ChessPadService extends AccessibilityService {
     static final int MODE_CAL_TOP_LEFT = 1;
     static final int MODE_CAL_BOTTOM_RIGHT = 2;
 
+    // Points inside a square that are compared before/after (fractions of the square).
+    // Centre catches move dots, the edge points catch capture rings.
+    private static final float[][] SAMPLE_POINTS = {
+            {0.5f, 0.5f}, {0.5f, 0.08f}, {0.5f, 0.92f}, {0.08f, 0.5f}, {0.92f, 0.5f}
+    };
+    private static final int DIFF_THRESHOLD = 45; // sum of |dR|+|dG|+|dB|, averaged 3x3
+    private static final long AFTER_TAP_DELAY_MS = 450;
+
     private WindowManager wm;
     private OverlayView overlay;
     private SharedPreferences prefs;
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     boolean inChess = false;
     boolean paused = false;
@@ -46,6 +71,12 @@ public class ChessPadService extends AccessibilityService {
     int row = 6;
     int pickedCol = -1;
     int pickedRow = -1;
+
+    // Legal target squares of the picked piece, as {col, row}.
+    final List<int[]> targets = new ArrayList<>();
+    boolean targetMode = false;
+    boolean busy = false;
+    boolean smart = true; // 7 toggles jumping between legal squares
 
     // Board rectangle in screen pixels.
     final RectF board = new RectF();
@@ -60,6 +91,7 @@ public class ChessPadService extends AccessibilityService {
         super.onServiceConnected();
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        smart = prefs.getBoolean("smart", true);
         loadBoard();
 
         overlay = new OverlayView(this, this);
@@ -102,8 +134,9 @@ public class ChessPadService extends AccessibilityService {
         boolean nowInChess = CHESS_PKG.equals(pkg);
         if (nowInChess != inChess) {
             inChess = nowInChess;
-            if (!inChess && mode != MODE_PLAY) {
+            if (!inChess) {
                 mode = MODE_PLAY;
+                clearPick();
             }
             refresh();
         }
@@ -151,6 +184,7 @@ public class ChessPadService extends AccessibilityService {
             if (firstDown) {
                 paused = !paused;
                 mode = MODE_PLAY;
+                clearPick();
                 refresh();
             }
             return true;
@@ -165,38 +199,47 @@ public class ChessPadService extends AccessibilityService {
 
         switch (code) {
             case KeyEvent.KEYCODE_STAR:
-                if (firstDown) {
+                if (firstDown && !busy) {
+                    clearPick();
                     startCalibration();
                 }
                 return true;
             case KeyEvent.KEYCODE_DPAD_UP:
-                if (down) row = Math.max(0, row - 1);
-                refresh();
+                if (down && !busy) move(0, -1);
                 return true;
             case KeyEvent.KEYCODE_DPAD_DOWN:
-                if (down) row = Math.min(7, row + 1);
-                refresh();
+                if (down && !busy) move(0, 1);
                 return true;
             case KeyEvent.KEYCODE_DPAD_LEFT:
-                if (down) col = Math.max(0, col - 1);
-                refresh();
+                if (down && !busy) move(-1, 0);
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                if (down) col = Math.min(7, col + 1);
-                refresh();
+                if (down && !busy) move(1, 0);
                 return true;
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
             case KeyEvent.KEYCODE_NUMPAD_ENTER:
             case KeyEvent.KEYCODE_5:
-                if (firstDown) {
-                    tapSquare(col, row);
+                if (firstDown && !busy) press();
+                return true;
+            case KeyEvent.KEYCODE_7:
+                if (firstDown && !busy) {
+                    smart = !smart;
+                    prefs.edit().putBoolean("smart", smart).apply();
+                    if (!smart) targetMode = false;
+                    showToast = smart ? "Smart moves ON (7)" : "Smart moves OFF (7)";
+                    handler.removeCallbacks(hideToast);
+                    handler.postDelayed(hideToast, 1500);
+                    refresh();
                 }
                 return true;
             case KeyEvent.KEYCODE_0:
-                if (firstDown) {
-                    pickedCol = -1;
-                    pickedRow = -1;
+                if (firstDown && !busy) {
+                    if (targetMode) {
+                        targetMode = false; // keep the piece picked, move freely
+                    } else {
+                        clearPick();
+                    }
                     refresh();
                 }
                 return true;
@@ -204,6 +247,183 @@ public class ChessPadService extends AccessibilityService {
                 return false; // Back, Menu, Call etc. go to chess.com as normal.
         }
     }
+
+    private void move(int dx, int dy) {
+        if (targetMode) {
+            jumpToTarget(dx, dy);
+        } else {
+            col = Math.max(0, Math.min(7, col + dx));
+            row = Math.max(0, Math.min(7, row + dy));
+        }
+        refresh();
+    }
+
+    /** Moves the cursor to the nearest legal square (or the picked square) in the given direction. */
+    private void jumpToTarget(int dx, int dy) {
+        List<int[]> candidates = new ArrayList<>(targets);
+        candidates.add(new int[]{pickedCol, pickedRow});
+        int[] best = null;
+        float bestScore = Float.MAX_VALUE;
+        for (int[] t : candidates) {
+            int vx = t[0] - col, vy = t[1] - row;
+            int along = vx * dx + vy * dy;
+            if (along <= 0) continue;
+            int across = Math.abs(vx * dy - vy * dx);
+            float score = along + 2f * across;
+            if (score < bestScore) {
+                bestScore = score;
+                best = t;
+            }
+        }
+        if (best != null) {
+            col = best[0];
+            row = best[1];
+        }
+    }
+
+    private void press() {
+        if (pickedCol >= 0) {
+            // Second tap: the destination (or the same square to cancel).
+            tapSquare(col, row);
+            clearPick();
+            refresh();
+            return;
+        }
+        // First tap: pick a piece.
+        if (smart && Build.VERSION.SDK_INT >= 30) {
+            pickWithTargets(col, row);
+        } else {
+            tapSquare(col, row);
+            pickedCol = col;
+            pickedRow = row;
+            refresh();
+        }
+    }
+
+    private void clearPick() {
+        pickedCol = -1;
+        pickedRow = -1;
+        targetMode = false;
+        targets.clear();
+    }
+
+    // ---------------------------------------------------------------- legal squares
+
+    @TargetApi(30)
+    private void pickWithTargets(final int c, final int r) {
+        busy = true;
+        takeShot(2, before -> {
+            tapSquare(c, r);
+            pickedCol = c;
+            pickedRow = r;
+            refresh();
+            if (before == null) {
+                busy = false;
+                return;
+            }
+            handler.postDelayed(() -> takeShot(2, after -> {
+                targets.clear();
+                if (after != null) {
+                    findTargets(before, after, c, r);
+                    after.recycle();
+                }
+                before.recycle();
+                busy = false;
+                if (pickedCol == c && pickedRow == r && !targets.isEmpty()) {
+                    targetMode = true;
+                    jumpToNearestTarget();
+                }
+                refresh();
+            }), AFTER_TAP_DELAY_MS);
+        });
+    }
+
+    private void jumpToNearestTarget() {
+        int[] best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (int[] t : targets) {
+            int d = Math.abs(t[0] - col) + Math.abs(t[1] - row);
+            if (d < bestDist) {
+                bestDist = d;
+                best = t;
+            }
+        }
+        if (best != null) {
+            col = best[0];
+            row = best[1];
+        }
+    }
+
+    private void findTargets(Bitmap before, Bitmap after, int pc, int pr) {
+        float sw = board.width() / 8f;
+        float sh = board.height() / 8f;
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (c == pc && r == pr) continue;
+                for (float[] p : SAMPLE_POINTS) {
+                    int x = (int) (board.left + (c + p[0]) * sw);
+                    int y = (int) (board.top + (r + p[1]) * sh);
+                    if (pixelDiff(before, after, x, y) > DIFF_THRESHOLD) {
+                        targets.add(new int[]{c, r});
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private static int pixelDiff(Bitmap a, Bitmap b, int x, int y) {
+        int w = Math.min(a.getWidth(), b.getWidth());
+        int h = Math.min(a.getHeight(), b.getHeight());
+        long sum = 0;
+        int n = 0;
+        for (int yy = y - 1; yy <= y + 1; yy++) {
+            for (int xx = x - 1; xx <= x + 1; xx++) {
+                if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                int p = a.getPixel(xx, yy), q = b.getPixel(xx, yy);
+                sum += Math.abs(((p >> 16) & 0xff) - ((q >> 16) & 0xff))
+                        + Math.abs(((p >> 8) & 0xff) - ((q >> 8) & 0xff))
+                        + Math.abs((p & 0xff) - (q & 0xff));
+                n++;
+            }
+        }
+        return n == 0 ? 0 : (int) (sum / n);
+    }
+
+    /** Takes a screenshot as a software bitmap, or null on failure. Retries when called too often. */
+    @TargetApi(30)
+    private void takeShot(final int retries, final Consumer<Bitmap> cb) {
+        takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
+            @Override
+            public void onSuccess(ScreenshotResult result) {
+                Bitmap soft = null;
+                HardwareBuffer hb = result.getHardwareBuffer();
+                try {
+                    Bitmap hw = Bitmap.wrapHardwareBuffer(hb, result.getColorSpace());
+                    if (hw != null) {
+                        soft = hw.copy(Bitmap.Config.ARGB_8888, false);
+                        hw.recycle();
+                    }
+                } catch (Exception e) {
+                    soft = null;
+                } finally {
+                    hb.close();
+                }
+                cb.accept(soft);
+            }
+
+            @Override
+            public void onFailure(int errorCode) {
+                if (retries > 0) {
+                    handler.postDelayed(() -> takeShot(retries - 1, cb), 350);
+                } else {
+                    cb.accept(null);
+                }
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- calibration
 
     private boolean handleCalibrationKey(int code, boolean down, boolean firstDown, int repeat) {
         float small = repeat > 6 ? 12f : 3f;
@@ -285,35 +505,24 @@ public class ChessPadService extends AccessibilityService {
 
     // ---------------------------------------------------------------- taps
 
-    float squareCenterX(int c) {
-        return board.left + (c + 0.5f) * board.width() / 8f;
-    }
-
-    float squareCenterY(int r) {
-        return board.top + (r + 0.5f) * board.height() / 8f;
-    }
-
     private void tapSquare(int c, int r) {
-        float x = squareCenterX(c);
-        float y = squareCenterY(r);
+        float x = board.left + (c + 0.5f) * board.width() / 8f;
+        float y = board.top + (r + 0.5f) * board.height() / 8f;
         Path path = new Path();
         path.moveTo(x, y);
         GestureDescription.StrokeDescription stroke =
                 new GestureDescription.StrokeDescription(path, 0, 60);
         GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
         dispatchGesture(gesture, null, null);
-
-        if (pickedCol < 0) {
-            pickedCol = c;
-            pickedRow = r;
-        } else {
-            pickedCol = -1;
-            pickedRow = -1;
-        }
-        refresh();
     }
 
     // ---------------------------------------------------------------- overlay
+
+    String showToast = null;
+    private final Runnable hideToast = () -> {
+        showToast = null;
+        refresh();
+    };
 
     void refresh() {
         if (overlay == null) {

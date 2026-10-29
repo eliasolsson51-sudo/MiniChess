@@ -14,7 +14,8 @@ Play in the official chess.com app on a keypad phone with the D-pad. Games are p
 | --- | --- |
 | D-pad | Move the marker |
 | OK / 5 | Tap the square (piece first, then target) |
-| 0 | Clear the yellow highlight |
+| 0 | After picking: free movement. Otherwise: clear the yellow highlight |
+| 7 | Smart moves on/off (jump only between legal squares) |
 | # | Pause / resume (menus work as normal when paused) |
 | * | Calibrate the board |
 
