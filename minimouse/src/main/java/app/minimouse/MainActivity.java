@@ -37,7 +37,7 @@ public class MainActivity extends Activity {
         help.setText("Hold *: cursor on/off\n"
                 + "D-pad: move (hold to speed up)\n"
                 + "Push against the top/bottom edge: scroll\n"
-                + "OK: tap\n"
+                + "OK: tap (hold = long press, like a finger)\n"
                 + "5: long press\n"
                 + "1: drag mode on/off (select text, sliders, maps)\n"
                 + "2 / 8: previous / next post\n"

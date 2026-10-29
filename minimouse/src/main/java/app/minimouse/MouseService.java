@@ -31,7 +31,7 @@ import java.util.List;
  *
  *   Hold *       cursor on/off (not while the keyboard is open: TT9 uses it)
  *   D-pad        move (hold to speed up); pushing against the top/bottom edge scrolls
- *   OK           tap
+ *   OK           finger down/up: short = tap, hold = long press
  *   5            long press
  *   1            drag mode: finger down / finger up (select text, move sliders and maps)
  *   2 / 8        smart scroll: previous / next post
@@ -197,19 +197,30 @@ public class MouseService extends AccessibilityService {
             return true;
         }
 
+        // OK works like a finger: down while the key is down, up when it is released.
+        // A short press is a tap, holding it is a long press.
+        boolean isOk = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
+                || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
+        if (isOk) {
+            if (firstDown) {
+                stopHold();
+                if (dragging) {
+                    endDrag();
+                } else {
+                    fingerDown();
+                }
+            } else if (!down) {
+                fingerUp();
+            }
+            return true;
+        }
+
         if (!firstDown) {
             // Swallow repeats and key-ups of the keys we handle below.
             return isMouseKey(code);
         }
 
         switch (code) {
-            case KeyEvent.KEYCODE_DPAD_CENTER:
-            case KeyEvent.KEYCODE_ENTER:
-            case KeyEvent.KEYCODE_NUMPAD_ENTER:
-                stopHold();
-                if (dragging) endDrag();
-                else tap(60);
-                return true;
             case KeyEvent.KEYCODE_5:
                 tap(700);
                 return true;
@@ -458,6 +469,34 @@ public class MouseService extends AccessibilityService {
         Path p = new Path();
         p.moveTo(x, y);
         dispatch(new GestureDescription.StrokeDescription(p, 0, durationMs));
+    }
+
+    // Finger held down by the OK key.
+    private GestureDescription.StrokeDescription okStroke;
+    private float okX, okY;
+
+    private void fingerDown() {
+        if (Build.VERSION.SDK_INT < 26) {
+            tap(60); // no "keep finger down" on old Android: plain tap
+            return;
+        }
+        Path p = new Path();
+        p.moveTo(x, y);
+        okX = x;
+        okY = y;
+        okStroke = new GestureDescription.StrokeDescription(p, 0, 40, true);
+        dispatch(okStroke);
+    }
+
+    private void fingerUp() {
+        if (okStroke == null || Build.VERSION.SDK_INT < 26) return;
+        Path p = new Path();
+        p.moveTo(okX, okY);
+        try {
+            dispatch(okStroke.continueStroke(p, 0, 20, false));
+        } catch (Exception ignored) {
+        }
+        okStroke = null;
     }
 
     private void doubleTap() {
