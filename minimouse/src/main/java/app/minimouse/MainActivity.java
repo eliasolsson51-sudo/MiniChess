@@ -46,7 +46,7 @@ public class MainActivity extends Activity {
                 + "0: double tap\n"
                 + "7: paste into the text field\n"
                 + "Back: cursor off\n\n"
-                + "While the cursor is on it uses the number keys, so turn it off (hold *) to type.");
+                + "Holding * does nothing while the keyboard is open, so TT9 works as normal.");
         box.addView(help);
 
         ScrollView scroll = new ScrollView(this);

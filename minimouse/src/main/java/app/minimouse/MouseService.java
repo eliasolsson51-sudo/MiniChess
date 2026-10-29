@@ -29,7 +29,7 @@ import java.util.List;
 /**
  * A D-pad mouse cursor for any app.
  *
- *   Hold *       cursor on/off
+ *   Hold *       cursor on/off (not while the keyboard is open: TT9 uses it)
  *   D-pad        move (hold to speed up); pushing against the top/bottom edge scrolls
  *   OK           tap
  *   5            long press
@@ -67,6 +67,7 @@ public class MouseService extends AccessibilityService {
     private boolean starConsumed = false;
     private final Runnable starHeld = () -> {
         if (!starDown || starConsumed) return;
+        if (keyboardOpen()) return; // TT9 uses holding * for its own things
         starConsumed = true;
         setActive(!active);
     };
@@ -269,6 +270,16 @@ public class MouseService extends AccessibilityService {
             default:
                 return false;
         }
+    }
+
+    private boolean keyboardOpen() {
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                if (w.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     private void setActive(boolean on) {
