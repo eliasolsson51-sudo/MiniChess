@@ -3,11 +3,13 @@ package app.minimouse;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.PointF;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Handler;
@@ -24,45 +26,70 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * A D-pad mouse cursor for any app.
  *
  *   Hold *       cursor on/off (not while the keyboard is open: TT9 uses it)
- *                The cursor pauses itself while you type and comes back afterwards.
- *   D-pad        move (hold to speed up); pushing against the top/bottom edge scrolls
- *   OK           finger down/up: short = tap, hold = long press
+ *   D-pad        short press: jump to the nearest button/link in that direction
+ *                (a plain step where there's nothing to jump to, e.g. over text);
+ *                hold: glide freely. Pushing against the top/bottom edge scrolls.
+ *   OK           finger down/up: short = tap, hold = long press.
+ *                Taps the middle of the outlined element.
  *   5            long press
- *   1            drag mode: finger down / finger up (select text, move sliders and maps)
- *   2 / 8        smart scroll: previous / next post
- *   4 / 6        scroll left / right
- *   3 / 9        zoom in / out
  *   0            double tap
+ *   1            drag mode: finger down / finger up (select text, sliders, maps)
  *   7            paste into the focused text field
+ *   2 / 8        previous / next post
+ *   3 / 9        zoom in / out
+ *   4 / 6        scroll left / right; hold = swipe in from the left / right edge
  *   Back         back in the app as normal (ends a drag)
+ *
+ * The cursor pauses itself while the keyboard is open and in apps picked in the app
+ * screen, hides after a few idle seconds, and remembers its position per app.
  */
 public class MouseService extends AccessibilityService {
 
     private static final long HOLD_DELAY_MS = 150;
     private static final long HOLD_INTERVAL_MS = 30;
-    private static final float STEP_DP = 10f;          // one press
+    private static final float STEP_DP = 8f;           // one press without a jump target
     private static final float HOLD_START_DP = 6f;     // per 30 ms when held
     private static final float HOLD_RAMP_DP = 1.5f;
     private static final float HOLD_MAX_DP = 30f;
     private static final long STAR_HOLD_MS = 500;
+    private static final long SIDE_HOLD_MS = 400;      // hold 4/6 = edge swipe
     private static final long EDGE_SCROLL_EVERY_MS = 260;
+    private static final long IDLE_HIDE_MS = 4000;
+    private static final long TARGETS_MAX_AGE_MS = 400;
 
     private WindowManager wm;
     private Pointer pointer;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private SharedPreferences prefs;
 
     boolean active = false;      // the user has turned the cursor on
-    boolean suspended = false;   // paused while the keyboard is open
+    boolean suspended = false;   // paused: keyboard open or a paused app in front
+    boolean idleHidden = false;  // hidden after a while without movement
     float x, y;
     float dp;
     private int screenW, screenH;
     private int touchSlop;
+
+    // Foreground app, paused apps and remembered positions.
+    private String currentPkg = "";
+    private Set<String> excluded;
+    private final Map<String, PointF> positions = new HashMap<>();
+    private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
+            (sp, key) -> {
+                if (Prefs.KEY_EXCLUDED.equals(key)) {
+                    excluded = Prefs.excluded(this);
+                    updateSuspended();
+                }
+            };
 
     // * long-press detection (timer based, works without key repeats).
     private boolean starDown = false;
@@ -72,6 +99,15 @@ public class MouseService extends AccessibilityService {
         if (keyboardOpen()) return; // TT9 uses holding * for its own things
         starConsumed = true;
         setActive(!active);
+    };
+
+    // 4/6: short = scroll sideways, hold = swipe in from the edge.
+    private int sideKey = -1;
+    private boolean sideConsumed = false;
+    private final Runnable sideHeld = () -> {
+        if (sideKey < 0 || sideConsumed) return;
+        sideConsumed = true;
+        edgeSwipe(sideKey == KeyEvent.KEYCODE_4);
     };
 
     // Held D-pad direction.
@@ -85,15 +121,39 @@ public class MouseService extends AccessibilityService {
             holdSteps++;
             float speed = Math.min(HOLD_MAX_DP, HOLD_START_DP + holdSteps * HOLD_RAMP_DP) * dp;
             moveBy(holdDx * speed, holdDy * speed, holdDy);
+            noteActivity();
             handler.postDelayed(this, HOLD_INTERVAL_MS);
         }
     };
     private long lastEdgeScroll = 0;
 
+    // Clickable elements on screen (cached briefly).
+    private static final class Target {
+        final Rect r = new Rect();
+        boolean editable;
+    }
+    private final List<Target> targets = new ArrayList<>();
+    private final List<Rect> textBlocks = new ArrayList<>();
+    private long targetsTime = 0;
+    Rect outline = null;          // element under the cursor, drawn as an outline
+    private boolean outlineEditable = false;
+
     // Drag mode: the "finger" stays down between gestures.
     boolean dragging = false;
     private GestureDescription.StrokeDescription dragStroke;
     private float dragX, dragY;
+
+    // Finger held down by the OK key.
+    private GestureDescription.StrokeDescription okStroke;
+    private float okX, okY;
+    private boolean okRevealOnly = false;
+
+    private final Runnable idleHide = () -> {
+        if (active && !dragging && okStroke == null && holdKey < 0) {
+            idleHidden = true;
+            updateVisibility();
+        }
+    };
 
     String toast = null;
     private final Runnable hideToast = () -> {
@@ -112,6 +172,10 @@ public class MouseService extends AccessibilityService {
         touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
         x = screenW / 2f;
         y = screenH / 2f;
+
+        prefs = Prefs.get(this);
+        excluded = Prefs.excluded(this);
+        prefs.registerOnSharedPreferenceChangeListener(prefsListener);
 
         pointer = new Pointer(this);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
@@ -135,25 +199,15 @@ public class MouseService extends AccessibilityService {
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
         int t = event.getEventType();
-        if (t == AccessibilityEvent.TYPE_WINDOWS_CHANGED
-                || t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            checkKeyboard();
+        if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            String pkg = foregroundPackage();
+            if (pkg != null && !pkg.equals(currentPkg)) appChanged(pkg);
         }
-    }
-
-    /** Pauses the cursor while the keyboard is open and brings it back when it closes. */
-    private boolean checkKeyboard() {
-        boolean kb = keyboardOpen();
-        boolean shouldSuspend = active && kb;
-        if (shouldSuspend != suspended) {
-            suspended = shouldSuspend;
-            if (suspended) {
-                stopHold();
-                if (dragging) endDrag();
-            }
-            updateVisibility();
+        if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || t == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            targetsTime = 0; // screen changed: re-read clickables next time
+            updateSuspended();
         }
-        return suspended;
     }
 
     @Override
@@ -163,6 +217,7 @@ public class MouseService extends AccessibilityService {
     @Override
     public void onDestroy() {
         stopHold();
+        if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(prefsListener);
         if (pointer != null) {
             try {
                 wm.removeView(pointer);
@@ -171,6 +226,63 @@ public class MouseService extends AccessibilityService {
             pointer = null;
         }
         super.onDestroy();
+    }
+
+    // ---------------------------------------------------------------- apps
+
+    private String foregroundPackage() {
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null || root.getPackageName() == null) return null;
+            String pkg = root.getPackageName().toString();
+            if (pkg.equals(getPackageName()) || pkg.equals("com.android.systemui")) return null;
+            return pkg;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Remembers the cursor position for the old app and restores it for the new one. */
+    private void appChanged(String pkg) {
+        if (!currentPkg.isEmpty()) positions.put(currentPkg, new PointF(x, y));
+        currentPkg = pkg;
+        PointF p = positions.get(pkg);
+        if (p != null) {
+            x = p.x;
+            y = p.y;
+        } else {
+            x = screenW / 2f;
+            y = screenH / 2f;
+        }
+        outline = null;
+        if (pointer != null) pointer.invalidate();
+    }
+
+    /** Pauses the cursor while typing or in a paused app; brings it back afterwards. */
+    private boolean updateSuspended() {
+        boolean should = active && (keyboardOpen()
+                || (excluded != null && excluded.contains(currentPkg)));
+        if (should != suspended) {
+            suspended = should;
+            if (suspended) {
+                stopHold();
+                if (dragging) endDrag();
+            } else {
+                noteActivity();
+            }
+            updateVisibility();
+        }
+        return suspended;
+    }
+
+    private boolean keyboardOpen() {
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                if (w.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- keys
@@ -201,7 +313,13 @@ public class MouseService extends AccessibilityService {
         }
 
         if (!active) return false;
-        if (checkKeyboard()) return false; // typing: all keys go to TT9
+        if (updateSuspended()) return false; // typing or a paused app: keys work as normal
+
+        // Any of our keys brings a hidden cursor back.
+        boolean wasHidden = idleHidden;
+        if (firstDown && isMouseKey(code)) {
+            noteActivity();
+        }
 
         int dx = 0, dy = 0;
         switch (code) {
@@ -213,28 +331,52 @@ public class MouseService extends AccessibilityService {
         }
         if (dx != 0 || dy != 0) {
             if (firstDown) {
-                moveBy(dx * STEP_DP * dp, dy * STEP_DP * dp, dy);
+                // A hidden cursor first just reappears where it was.
+                if (!wasHidden) shortMove(dx, dy);
                 startHold(code, dx, dy);
             } else if (!down && code == holdKey) {
                 stopHold();
+                noteActivity();
             }
             return true;
         }
 
         // OK works like a finger: down while the key is down, up when it is released.
-        // A short press is a tap, holding it is a long press.
         boolean isOk = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
                 || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
         if (isOk) {
             if (firstDown) {
                 stopHold();
-                if (dragging) {
-                    endDrag();
-                } else {
-                    fingerDown();
-                }
+                okRevealOnly = wasHidden;
+                if (okRevealOnly) return true; // don't tap where you can't see the cursor
+                if (dragging) endDrag();
+                else fingerDown();
             } else if (!down) {
-                fingerUp();
+                if (!okRevealOnly) fingerUp();
+                okRevealOnly = false;
+                noteActivity();
+            }
+            return true;
+        }
+
+        // 4/6: decide on release (short = scroll) or after a while (hold = edge swipe).
+        if (code == KeyEvent.KEYCODE_4 || code == KeyEvent.KEYCODE_6) {
+            if (firstDown) {
+                sideKey = code;
+                sideConsumed = false;
+                handler.removeCallbacks(sideHeld);
+                handler.postDelayed(sideHeld, SIDE_HOLD_MS);
+            } else if (!down && code == sideKey) {
+                handler.removeCallbacks(sideHeld);
+                if (!sideConsumed) {
+                    if (code == KeyEvent.KEYCODE_4) {
+                        swipe(x, y, Math.min(screenW - 2, x + screenW * 0.35f), y, 250);
+                    } else {
+                        swipe(x, y, Math.max(1, x - screenW * 0.35f), y, 250);
+                    }
+                    targetsTime = 0;
+                }
+                sideKey = -1;
             }
             return true;
         }
@@ -245,9 +387,11 @@ public class MouseService extends AccessibilityService {
         }
 
         switch (code) {
-            case KeyEvent.KEYCODE_5:
-                tap(700);
+            case KeyEvent.KEYCODE_5: {
+                PointF p = tapPoint();
+                tapAt(p.x, p.y, 700);
                 return true;
+            }
             case KeyEvent.KEYCODE_1:
                 if (dragging) endDrag();
                 else startDrag();
@@ -257,12 +401,6 @@ public class MouseService extends AccessibilityService {
                 return true;
             case KeyEvent.KEYCODE_8:
                 smartScroll(1);
-                return true;
-            case KeyEvent.KEYCODE_4:
-                swipe(x, y, Math.min(screenW - 2, x + screenW * 0.35f), y, 250);
-                return true;
-            case KeyEvent.KEYCODE_6:
-                swipe(x, y, Math.max(1, x - screenW * 0.35f), y, 250);
                 return true;
             case KeyEvent.KEYCODE_3:
                 pinch(true);
@@ -290,6 +428,10 @@ public class MouseService extends AccessibilityService {
 
     private static boolean isMouseKey(int code) {
         switch (code) {
+            case KeyEvent.KEYCODE_DPAD_UP:
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
             case KeyEvent.KEYCODE_NUMPAD_ENTER:
@@ -309,22 +451,28 @@ public class MouseService extends AccessibilityService {
         }
     }
 
-    private boolean keyboardOpen() {
-        try {
-            for (AccessibilityWindowInfo w : getWindows()) {
-                if (w.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return true;
-            }
-        } catch (Exception ignored) {
-        }
-        return false;
-    }
-
     private void setActive(boolean on) {
         if (!on && dragging) endDrag();
         active = on;
         suspended = false;
         stopHold();
-        showToast(on ? "Mus på  (håll * = av)" : "Mus av");
+        if (on) {
+            noteActivity();
+            updateSuspended();
+        }
+        if (!on) showToast("Mus av");
+        else if (suspended) showToast("Mus på, pausad i den här appen");
+        else showToast("Mus på  (håll * = av)");
+    }
+
+    /** Keeps the cursor visible and restarts the idle timer. */
+    private void noteActivity() {
+        handler.removeCallbacks(idleHide);
+        if (idleHidden) {
+            idleHidden = false;
+            updateVisibility();
+        }
+        handler.postDelayed(idleHide, IDLE_HIDE_MS);
     }
 
     private void showToast(String msg) {
@@ -336,9 +484,13 @@ public class MouseService extends AccessibilityService {
 
     private void updateVisibility() {
         if (pointer == null) return;
-        boolean show = (active && !suspended) || toast != null;
+        boolean show = cursorVisible() || toast != null;
         pointer.setVisibility(show ? View.VISIBLE : View.GONE);
         pointer.invalidate();
+    }
+
+    boolean cursorVisible() {
+        return active && !suspended && !idleHidden;
     }
 
     private void startHold(int key, int dx, int dy) {
@@ -355,6 +507,43 @@ public class MouseService extends AccessibilityService {
         handler.removeCallbacks(holdStep);
     }
 
+    // ---------------------------------------------------------------- moving
+
+    /** Short press: jump to the nearest clickable in that direction, or take a plain step. */
+    private void shortMove(int dx, int dy) {
+        if (!dragging) {
+            refreshTargets(false);
+            if (smartHere()) {
+                Rect best = null;
+                float bestScore = Float.MAX_VALUE;
+                float maxAlong = (dy != 0 ? screenH : screenW) * 0.45f;
+                float minAlong = 4 * dp;
+                Rect current = outline;
+                for (Target t : targets) {
+                    if (current != null && t.r.equals(current)) continue;
+                    if (t.r.contains((int) x, (int) y)) continue; // the one we're on
+                    float vx = t.r.exactCenterX() - x, vy = t.r.exactCenterY() - y;
+                    float along = vx * dx + vy * dy;
+                    if (along < minAlong || along > maxAlong) continue;
+                    float across = Math.abs(vx * dy - vy * dx);
+                    float score = along + 2f * across;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = t.r;
+                    }
+                }
+                if (best != null) {
+                    x = clampX(best.exactCenterX());
+                    y = clampY(best.exactCenterY());
+                    updateOutline();
+                    if (pointer != null) pointer.invalidate();
+                    return;
+                }
+            }
+        }
+        moveBy(dx * STEP_DP * dp, dy * STEP_DP * dp, dy);
+    }
+
     /** Moves the cursor; pushing against the top or bottom edge scrolls the page instead. */
     private void moveBy(float ddx, float ddy, int dirY) {
         float margin = 2 * dp;
@@ -367,6 +556,7 @@ public class MouseService extends AccessibilityService {
         x = Math.max(0, Math.min(screenW - 1, x + ddx));
         y = Math.max(0, Math.min(screenH - 1, y + ddy));
         if (dragging) dragTo(x, y);
+        else updateOutline();
         if (pointer != null) pointer.invalidate();
     }
 
@@ -383,6 +573,92 @@ public class MouseService extends AccessibilityService {
             float sy = screenH * 0.25f;
             stillSwipe(cx, sy, cx, sy + dist, 220);
         }
+        targetsTime = 0;
+    }
+
+    // ---------------------------------------------------------------- clickables
+
+    /** Smart jumping only where it helps: enough buttons around, not over a block of text. */
+    private boolean smartHere() {
+        if (targets.size() < 3) return false;
+        for (Rect r : textBlocks) {
+            if (r.contains((int) x, (int) y)) return false;
+        }
+        return true;
+    }
+
+    private void refreshTargets(boolean ifStaleOnly) {
+        long now = SystemClock.uptimeMillis();
+        if (ifStaleOnly && now - targetsTime < TARGETS_MAX_AGE_MS) return;
+        if (!ifStaleOnly && now - targetsTime < 120) return;
+        targetsTime = now;
+        targets.clear();
+        textBlocks.clear();
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                int type = w.getType();
+                if (type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY
+                        || type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue;
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r != null) collect(r, 0);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void collect(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 60 || targets.size() > 300) return;
+        if (!n.isVisibleToUser()) return;
+        Rect r = new Rect();
+        n.getBoundsInScreen(r);
+        if (r.isEmpty()) return;
+        boolean clickable = n.isClickable() || n.isLongClickable() || n.isEditable();
+        float area = (float) r.width() * r.height();
+        boolean small = area < screenW * screenH * 0.5f;
+        if (clickable && small && r.width() > 6 * dp && r.height() > 6 * dp) {
+            Target t = new Target();
+            t.r.set(r);
+            t.editable = n.isEditable();
+            targets.add(t);
+        }
+        CharSequence text = n.getText();
+        if (!clickable && text != null && text.length() > 120) {
+            textBlocks.add(r);
+        }
+        for (int i = 0; i < n.getChildCount(); i++) {
+            collect(n.getChild(i), depth + 1);
+        }
+    }
+
+    /** The smallest clickable element under the cursor becomes the outlined target. */
+    private void updateOutline() {
+        refreshTargets(true);
+        Rect best = null;
+        boolean editable = false;
+        if (smartHere()) {
+            long bestArea = Long.MAX_VALUE;
+            for (Target t : targets) {
+                if (!t.r.contains((int) x, (int) y)) continue;
+                long area = (long) t.r.width() * t.r.height();
+                if (area < bestArea) {
+                    bestArea = area;
+                    best = t.r;
+                    editable = t.editable;
+                }
+            }
+        }
+        outline = best;
+        outlineEditable = editable;
+    }
+
+    /** Where a tap lands: the middle of the outlined element, or the cursor itself. */
+    private PointF tapPoint() {
+        updateOutline();
+        if (outline != null && !outlineEditable
+                && (long) outline.width() * outline.height() < (long) screenW * screenH / 3) {
+            return new PointF(outline.exactCenterX(), outline.exactCenterY());
+        }
+        return new PointF(x, y);
     }
 
     // ---------------------------------------------------------------- smart scroll
@@ -406,7 +682,6 @@ public class MouseService extends AccessibilityService {
         if (found && !kids.isEmpty()) {
             float gap = 6 * dp;
             if (dir > 0) {
-                // First item that starts below the top of the list.
                 for (Rect k : kids) {
                     if (k.top > top + gap) {
                         dist = k.top - top;
@@ -414,7 +689,6 @@ public class MouseService extends AccessibilityService {
                     }
                 }
             } else {
-                // Start of the item cut off at the top, if any.
                 for (Rect k : kids) {
                     if (k.top < top - gap && k.bottom > top + gap) {
                         dist = top - k.top;
@@ -422,7 +696,6 @@ public class MouseService extends AccessibilityService {
                 }
             }
         }
-        // Long posts (or no item found): scroll most of a screen.
         if (dist <= 0 || dist > maxDist) dist = h * 0.6f;
 
         float cx = box.exactCenterX();
@@ -434,6 +707,7 @@ public class MouseService extends AccessibilityService {
             float sy = box.top + 10 * dp;
             stillSwipe(cx, sy, cx, Math.min(box.bottom - 2, sy + dist), 380);
         }
+        targetsTime = 0;
     }
 
     /** Finds the deepest vertically scrollable view under the cursor and its children's bounds. */
@@ -484,7 +758,6 @@ public class MouseService extends AccessibilityService {
             AccessibilityNodeInfo found = deepestScrollable(node.getChild(i), depth + 1);
             if (found != null) return found;
         }
-        // Skip horizontal-only scrollers (carousels): they are wider than tall.
         if (node.isScrollable() && r.height() > 80 * dp && r.height() >= r.width() * 0.5f) {
             return node;
         }
@@ -493,26 +766,24 @@ public class MouseService extends AccessibilityService {
 
     // ---------------------------------------------------------------- gestures
 
-    private void tap(long durationMs) {
+    private void tapAt(float tx, float ty, long durationMs) {
         Path p = new Path();
-        p.moveTo(x, y);
+        p.moveTo(tx, ty);
         dispatch(new GestureDescription.StrokeDescription(p, 0, durationMs));
+        targetsTime = 0;
     }
 
-    // Finger held down by the OK key.
-    private GestureDescription.StrokeDescription okStroke;
-    private float okX, okY;
-
     private void fingerDown() {
+        PointF p = tapPoint();
         if (Build.VERSION.SDK_INT < 26) {
-            tap(60); // no "keep finger down" on old Android: plain tap
+            tapAt(p.x, p.y, 60); // no "keep finger down" on old Android: plain tap
             return;
         }
-        Path p = new Path();
-        p.moveTo(x, y);
-        okX = x;
-        okY = y;
-        okStroke = new GestureDescription.StrokeDescription(p, 0, 40, true);
+        Path path = new Path();
+        path.moveTo(p.x, p.y);
+        okX = p.x;
+        okY = p.y;
+        okStroke = new GestureDescription.StrokeDescription(path, 0, 40, true);
         dispatch(okStroke);
     }
 
@@ -525,17 +796,20 @@ public class MouseService extends AccessibilityService {
         } catch (Exception ignored) {
         }
         okStroke = null;
+        targetsTime = 0;
     }
 
     private void doubleTap() {
+        PointF p = tapPoint();
         Path p1 = new Path();
-        p1.moveTo(x, y);
+        p1.moveTo(p.x, p.y);
         Path p2 = new Path();
-        p2.moveTo(x, y);
+        p2.moveTo(p.x, p.y);
         GestureDescription.Builder b = new GestureDescription.Builder();
         b.addStroke(new GestureDescription.StrokeDescription(p1, 0, 40));
         b.addStroke(new GestureDescription.StrokeDescription(p2, 120, 40));
         dispatchGesture(b.build(), null, null);
+        targetsTime = 0;
     }
 
     private void swipe(float sx, float sy, float ex, float ey, long durationMs) {
@@ -543,6 +817,15 @@ public class MouseService extends AccessibilityService {
         p.moveTo(sx, sy);
         p.lineTo(ex, ey);
         dispatch(new GestureDescription.StrokeDescription(p, 0, durationMs));
+    }
+
+    /** Swipe in from the screen edge (opens side menus in many apps). */
+    private void edgeSwipe(boolean fromLeft) {
+        float sy = y;
+        float sx = fromLeft ? 1 : screenW - 2;
+        float ex = fromLeft ? screenW * 0.6f : screenW * 0.4f;
+        swipe(sx, sy, ex, sy, 300);
+        targetsTime = 0;
     }
 
     /** A swipe that stops and rests before lifting, so the page doesn't keep gliding. */
@@ -582,6 +865,7 @@ public class MouseService extends AccessibilityService {
         g.addStroke(new GestureDescription.StrokeDescription(p1, 0, 350));
         g.addStroke(new GestureDescription.StrokeDescription(p2, 0, 350));
         dispatchGesture(g.build(), null, null);
+        targetsTime = 0;
     }
 
     private float clampX(float v) {
@@ -606,6 +890,7 @@ public class MouseService extends AccessibilityService {
         dragX = x;
         dragY = y;
         dragging = true;
+        outline = null;
         dispatch(dragStroke);
         showToast("Dra: flytta och tryck 1 för att släppa");
     }
@@ -638,6 +923,7 @@ public class MouseService extends AccessibilityService {
         }
         dragStroke = null;
         dragging = false;
+        targetsTime = 0;
         if (pointer != null) pointer.invalidate();
     }
 
@@ -664,6 +950,8 @@ public class MouseService extends AccessibilityService {
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint dragFill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint box = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint boxInner = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint bg = new Paint();
         private final int[] loc = new int[2];
@@ -676,6 +964,12 @@ public class MouseService extends AccessibilityService {
             ring.setStyle(Paint.Style.STROKE);
             ring.setStrokeWidth(2 * s.dp);
             ring.setColor(Color.BLACK);
+            box.setStyle(Paint.Style.STROKE);
+            box.setStrokeWidth(2.5f * s.dp);
+            box.setColor(Color.rgb(0, 229, 255));
+            boxInner.setStyle(Paint.Style.STROKE);
+            boxInner.setStrokeWidth(1f * s.dp);
+            boxInner.setColor(Color.BLACK);
             text.setColor(Color.WHITE);
             text.setTextSize(14 * s.dp);
             bg.setColor(Color.argb(210, 0, 0, 0));
@@ -686,7 +980,14 @@ public class MouseService extends AccessibilityService {
             getLocationOnScreen(loc);
             c.save();
             c.translate(-loc[0], -loc[1]);
-            if (s.active && !s.suspended) {
+            if (s.cursorVisible()) {
+                if (s.outline != null && !s.dragging) {
+                    float in = 2 * s.dp;
+                    c.drawRect(s.outline.left + 1, s.outline.top + 1,
+                            s.outline.right - 1, s.outline.bottom - 1, box);
+                    c.drawRect(s.outline.left + in, s.outline.top + in,
+                            s.outline.right - in, s.outline.bottom - in, boxInner);
+                }
                 float r = 7 * s.dp;
                 c.drawCircle(s.x, s.y, r, s.dragging ? dragFill : fill);
                 c.drawCircle(s.x, s.y, r, ring);
