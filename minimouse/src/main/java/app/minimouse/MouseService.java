@@ -30,6 +30,7 @@ import java.util.List;
  * A D-pad mouse cursor for any app.
  *
  *   Hold *       cursor on/off (not while the keyboard is open: TT9 uses it)
+ *                The cursor pauses itself while you type and comes back afterwards.
  *   D-pad        move (hold to speed up); pushing against the top/bottom edge scrolls
  *   OK           finger down/up: short = tap, hold = long press
  *   5            long press
@@ -56,7 +57,8 @@ public class MouseService extends AccessibilityService {
     private Pointer pointer;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    boolean active = false;
+    boolean active = false;      // the user has turned the cursor on
+    boolean suspended = false;   // paused while the keyboard is open
     float x, y;
     float dp;
     private int screenW, screenH;
@@ -131,6 +133,27 @@ public class MouseService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+        int t = event.getEventType();
+        if (t == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                || t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            checkKeyboard();
+        }
+    }
+
+    /** Pauses the cursor while the keyboard is open and brings it back when it closes. */
+    private boolean checkKeyboard() {
+        boolean kb = keyboardOpen();
+        boolean shouldSuspend = active && kb;
+        if (shouldSuspend != suspended) {
+            suspended = shouldSuspend;
+            if (suspended) {
+                stopHold();
+                if (dragging) endDrag();
+            }
+            updateVisibility();
+        }
+        return suspended;
     }
 
     @Override
@@ -178,6 +201,7 @@ public class MouseService extends AccessibilityService {
         }
 
         if (!active) return false;
+        if (checkKeyboard()) return false; // typing: all keys go to TT9
 
         int dx = 0, dy = 0;
         switch (code) {
@@ -298,6 +322,7 @@ public class MouseService extends AccessibilityService {
     private void setActive(boolean on) {
         if (!on && dragging) endDrag();
         active = on;
+        suspended = false;
         stopHold();
         showToast(on ? "Mus på  (håll * = av)" : "Mus av");
     }
@@ -311,7 +336,8 @@ public class MouseService extends AccessibilityService {
 
     private void updateVisibility() {
         if (pointer == null) return;
-        pointer.setVisibility(active || toast != null ? View.VISIBLE : View.GONE);
+        boolean show = (active && !suspended) || toast != null;
+        pointer.setVisibility(show ? View.VISIBLE : View.GONE);
         pointer.invalidate();
     }
 
@@ -660,7 +686,7 @@ public class MouseService extends AccessibilityService {
             getLocationOnScreen(loc);
             c.save();
             c.translate(-loc[0], -loc[1]);
-            if (s.active) {
+            if (s.active && !s.suspended) {
                 float r = 7 * s.dp;
                 c.drawCircle(s.x, s.y, r, s.dragging ? dragFill : fill);
                 c.drawCircle(s.x, s.y, r, ring);

@@ -46,7 +46,7 @@ public class MainActivity extends Activity {
                 + "0: double tap\n"
                 + "7: paste into the text field\n"
                 + "Back: back in the app as normal\n\n"
-                + "Holding * does nothing while the keyboard is open, so TT9 works as normal.");
+                + "While the keyboard is open the cursor pauses itself, so TT9 works as normal. It comes back when you're done typing.");
         box.addView(help);
 
         ScrollView scroll = new ScrollView(this);
