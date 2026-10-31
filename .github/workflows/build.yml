@@ -26,12 +26,16 @@ jobs:
       - name: Build
         run: gradle assembleRelease --no-daemon
 
+      # MiniSpot needs a newer Gradle; its own wrapper JAR is not used (it failed validation).
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.4.1'
+
       - name: Build MiniSpot (modified)
         working-directory: minispot
         run: |
           printf 'storeFile=%s\nstorePassword=android\nkeyAlias=androiddebugkey\nkeyPassword=android\n' "$GITHUB_WORKSPACE/debug.keystore" > keystore.properties
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          gradle assembleRelease --no-daemon
 
       - name: Rename APKs
         run: |
