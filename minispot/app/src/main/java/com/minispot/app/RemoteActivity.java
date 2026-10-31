@@ -674,7 +674,16 @@ public class RemoteActivity extends Activity {
 
 	private void pop() {
 		if (stack.size() <= 1) {
-			moveTaskToBack(true);
+			// Go to the home screen rather than just stepping back: the app behind MiniSpot is
+			// often Spotify's own (heavy) screen, and showing it on a low-memory phone gets
+			// both apps killed. Spotify keeps playing in the background either way.
+			Intent home = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+				.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+			try {
+				startActivity(home);
+			} catch (Exception e) {
+				moveTaskToBack(true);
+			}
 			return;
 		}
 		stack.remove(stack.size() - 1);
