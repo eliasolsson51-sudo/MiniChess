@@ -26,12 +26,20 @@ jobs:
       - name: Build
         run: gradle assembleRelease --no-daemon
 
+      - name: Build MiniSpot (modified)
+        working-directory: minispot
+        run: |
+          printf 'storeFile=%s\nstorePassword=android\nkeyAlias=androiddebugkey\nkeyPassword=android\n' "$GITHUB_WORKSPACE/debug.keystore" > keystore.properties
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
       - name: Rename APKs
         run: |
           cp app/build/outputs/apk/release/app-release.apk MiniChess.apk
           cp autodark/build/outputs/apk/release/autodark-release.apk AutoDark.apk
           cp minisettings/build/outputs/apk/release/minisettings-release.apk MiniSettings.apk
           cp minimouse/build/outputs/apk/release/minimouse-release.apk MiniMouse.apk
+          cp minispot/app/build/outputs/apk/release/app-release.apk MiniSpot.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -43,4 +51,5 @@ jobs:
             AutoDark.apk
             MiniSettings.apk
             MiniMouse.apk
+            MiniSpot.apk
           make_latest: true
